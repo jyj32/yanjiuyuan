@@ -1,0 +1,55 @@
+{
+  "image": "D:\\code\\wrs_v2\\yanjiuyuan\\captures\\20260624-130254\\rgb.png",
+  "backend": "sam",
+  "model": "D:\\code\\wrs_v2\\sam_b.pt",
+  "keep": "best",
+  "box": null,
+  "points": [
+    {
+      "x": 587,
+      "y": 171,
+      "label": 1
+    },
+    {
+      "x": 904,
+      "y": 258,
+      "label": 1
+    },
+    {
+      "x": 900,
+      "y": 416,
+      "label": 1
+    },
+    {
+      "x": 597,
+      "y": 392,
+      "label": 1
+    },
+    {
+      "x": 461,
+      "y": 304,
+      "label": 1
+    },
+    {
+      "x": 326,
+      "y": 177,
+      "label": 1
+    },
+    {
+      "x": 266,
+      "y": 151,
+      "label": 1
+    }
+  ],
+  "num_raw_masks": 1,
+  "num_saved_masks": 1,
+  "overlay_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-143919\\overlay.png",
+  "detections": [
+    {
+      "index": 0,
+      "area_px": 217562,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-143919\\masks\\00_area217562_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-143919\\cutouts\\00_area217562_cutout.png"
+    }
+  ]
+}

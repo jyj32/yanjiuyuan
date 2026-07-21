@@ -1,0 +1,40 @@
+{
+  "image": "D:\\code\\wrs_v2\\yanjiuyuan\\captures\\20260624-130254\\rgb.png",
+  "backend": "sam",
+  "model": "D:\\code\\wrs_v2\\sam_b.pt",
+  "keep": "best",
+  "box": [
+    520,
+    560,
+    1490,
+    1040
+  ],
+  "points": [
+    {
+      "x": 1050,
+      "y": 790,
+      "label": 1
+    },
+    {
+      "x": 1550,
+      "y": 800,
+      "label": 0
+    },
+    {
+      "x": 850,
+      "y": 500,
+      "label": 0
+    }
+  ],
+  "num_raw_masks": 1,
+  "num_saved_masks": 1,
+  "overlay_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-143451\\overlay.png",
+  "detections": [
+    {
+      "index": 0,
+      "area_px": 354490,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-143451\\masks\\00_area354490_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-143451\\cutouts\\00_area354490_cutout.png"
+    }
+  ]
+}

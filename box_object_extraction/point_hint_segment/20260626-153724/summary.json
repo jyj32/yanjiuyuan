@@ -1,0 +1,65 @@
+{
+  "image": "D:\\code\\wrs_v2\\yanjiuyuan\\captures\\20260626-142515\\rgb.png",
+  "backend": "sam",
+  "model": "D:\\code\\wrs_v2\\sam_b.pt",
+  "keep": "best",
+  "box": null,
+  "points": [
+    {
+      "x": 712,
+      "y": 187,
+      "label": 1
+    },
+    {
+      "x": 741,
+      "y": 252,
+      "label": 1
+    },
+    {
+      "x": 819,
+      "y": 280,
+      "label": 1
+    },
+    {
+      "x": 920,
+      "y": 178,
+      "label": 1
+    },
+    {
+      "x": 972,
+      "y": 251,
+      "label": 1
+    },
+    {
+      "x": 1070,
+      "y": 299,
+      "label": 1
+    },
+    {
+      "x": 1170,
+      "y": 230,
+      "label": 1
+    },
+    {
+      "x": 1258,
+      "y": 204,
+      "label": 1
+    },
+    {
+      "x": 1214,
+      "y": 214,
+      "label": 1
+    }
+  ],
+  "num_raw_masks": 1,
+  "num_saved_masks": 1,
+  "overlay_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\point_hint_segment\\20260626-153724\\overlay.png",
+  "detections": [
+    {
+      "index": 0,
+      "area_px": 105102,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\point_hint_segment\\20260626-153724\\masks\\00_area105102_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\point_hint_segment\\20260626-153724\\cutouts\\00_area105102_cutout.png"
+    }
+  ]
+}

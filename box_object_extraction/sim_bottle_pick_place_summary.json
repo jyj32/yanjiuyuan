@@ -1,0 +1,10 @@
+{
+  "object_summary_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\box_object_extraction_summary.json",
+  "bottle_transform_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_icp_transform.txt",
+  "box_transform_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\box_transform_used.txt",
+  "bottle_model_path": "D:\\code\\wrs_v2\\yanjiuyuan\\models\\bottle.stl",
+  "box_collision_obstacle": true,
+  "table_obstacle": true,
+  "ik_solver": "ikfast",
+  "planned": false
+}

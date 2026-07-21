@@ -1,0 +1,330 @@
+from wrs import mgm, wd
+import math
+import numpy as np
+import os
+import wrs.modeling.collision_model as cm
+import wrs.robot_sim.end_effectors.grippers.dh76.dh76 as dh
+import wrs.basis.robot_math as rm
+import pickle
+import tkinter as tk
+from tkinter import filedialog
+from direct.task import Task
+
+# ---------- 全局变量 ----------
+gripper_s = None
+gripper_model = None
+saved_models = []          # 存储每个保存的 ModelCollection 对象
+grasp_info_list = []
+current_jaw_width = 0.1
+current_jaw_center_pos = np.array([0.0, 0.0, 0.025])
+current_jaw_center_rotmat = np.eye(3)
+
+base = None  # Panda3D 场景对象
+
+class ControlWindow:
+    def __init__(self, root, file_name):
+        self.root = root
+        self.root.title("夹爪位姿控制")
+        self.root.geometry("520x480")
+
+        self.label_font = ('Arial', 12)
+        self.entry_font = ('Arial', 12)
+        self.group_font = ('Arial', 12, 'bold')
+
+        self.var = {}
+        self.create_controls()
+        self.file_name = file_name
+
+    def create_controls(self):
+        params = [
+            ('group', '位置参数'),
+            ('param', 'X 位置 (m)', 'x', -0.1, 0.1, 0.0, 0.001),
+            ('param', 'Y 位置 (m)', 'y', -0.1, 0.1, 0.0, 0.001),
+            ('param', 'Z 位置 (m)', 'z', 0.0, 0.3, 0.025, 0.001),
+            ('group', '绕手爪坐标系角度'),
+            ('param', 'Roll (x) (deg)', 'roll', -180, 180, 0.0, 1.0),
+            ('param', 'Pitch (y) (deg)', 'pitch', -180, 180, 0.0, 1.0),
+            ('param', 'Yaw (z) (deg)', 'yaw', -180, 180, 90.0, 1.0),
+            ('group', '手爪宽度'),
+            ('param', 'Jaw Width (m)', 'jaw', 0.04, 0.12, 0.1, 0.001),
+        ]
+
+        for item in params:
+            if item[0] == 'group':
+                frame = tk.Frame(self.root)
+                frame.pack(pady=(10, 0), fill='x')
+                lbl = tk.Label(frame, text=item[1], font=self.group_font, fg='darkblue')
+                lbl.pack(anchor='w')
+                continue
+
+            _, label, key, from_, to, init, res = item
+            frame = tk.Frame(self.root)
+            frame.pack(pady=4, fill='x', padx=15)
+
+            lbl = tk.Label(frame, text=label, width=18, anchor='w', font=self.label_font)
+            lbl.pack(side=tk.LEFT)
+
+            var = tk.DoubleVar(value=init)
+            slider = tk.Scale(frame, from_=from_, to=to, resolution=res,
+                              orient=tk.HORIZONTAL, length=220,
+                              variable=var,
+                              command=lambda v, k=key: self.slider_changed(k))
+            slider.pack(side=tk.LEFT, padx=5)
+
+            entry_var = tk.StringVar(value=f"{init:.1f}" if key in ['roll','pitch','yaw'] else f"{init:.3f}")
+            entry = tk.Entry(frame, textvariable=entry_var, width=8, font=self.entry_font)
+            entry.pack(side=tk.LEFT, padx=5)
+            entry.bind('<Return>', lambda e, k=key: self.entry_changed(k))
+            entry.bind('<FocusOut>', lambda e, k=key: self.entry_changed(k))
+
+            self.var[key] = {'slider': slider, 'var': var, 'entry_var': entry_var}
+
+        # 按钮框架
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(pady=15)
+
+        tk.Button(btn_frame, text="保存位姿", font=self.label_font,
+                  command=self.output_pose).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="导入", font=self.label_font,
+                  command=self.import_poses).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="撤销(u)", font=self.label_font,
+                  command=self.undo_last).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="重置", font=self.label_font,
+                  command=self.reset).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="隐藏", font=self.label_font,
+                  command=self.hide_models).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="显示", font=self.label_font,
+                  command=self.show_models).pack(side=tk.LEFT, padx=5)
+
+        self.status_label = tk.Label(self.root, text="就绪", fg="green", font=self.label_font)
+        self.status_label.pack(pady=5)
+
+    # ---------- 隐藏/显示（通过 detach/attach） ----------
+    def hide_models(self):
+        global saved_models
+        if not saved_models:
+            self.status_label.config(text="没有保存的位姿可隐藏", fg="red")
+            return
+        for model in saved_models:
+            model.detach()          # 从场景移除
+        self.status_label.config(text="已隐藏所有保存的位姿", fg="blue")
+
+    def show_models(self):
+        global saved_models
+        if not saved_models:
+            self.status_label.config(text="没有保存的位姿可显示", fg="red")
+            return
+        for model in saved_models:
+            model.attach_to(base)   # 重新添加到场景
+        self.status_label.config(text="已显示所有保存的位姿", fg="blue")
+
+    # ---------- 滑块与数值输入回调 ----------
+    def slider_changed(self, key):
+        val = self.var[key]['var'].get()
+        if key in ['roll', 'pitch', 'yaw']:
+            self.var[key]['entry_var'].set(f"{val:.1f}")
+        else:
+            self.var[key]['entry_var'].set(f"{val:.3f}")
+        self.update_gripper()
+
+    def entry_changed(self, key):
+        try:
+            val = float(self.var[key]['entry_var'].get())
+            slider = self.var[key]['slider']
+            from_, to_ = slider.cget('from'), slider.cget('to')
+            if val < from_:
+                val = from_
+            elif val > to_:
+                val = to_
+            self.var[key]['var'].set(val)
+            if key in ['roll', 'pitch', 'yaw']:
+                self.var[key]['entry_var'].set(f"{val:.1f}")
+            else:
+                self.var[key]['entry_var'].set(f"{val:.3f}")
+            self.update_gripper()
+        except ValueError:
+            val = self.var[key]['var'].get()
+            if key in ['roll', 'pitch', 'yaw']:
+                self.var[key]['entry_var'].set(f"{val:.1f}")
+            else:
+                self.var[key]['entry_var'].set(f"{val:.3f}")
+
+    def get_values(self):
+        vals = {}
+        for key in self.var:
+            vals[key] = self.var[key]['var'].get()
+        return vals
+
+    # ---------- 更新当前夹爪显示 ----------
+    def update_gripper(self):
+        global gripper_s, gripper_model
+        global current_jaw_width, current_jaw_center_pos, current_jaw_center_rotmat
+
+        vals = self.get_values()
+        x, y, z = vals['x'], vals['y'], vals['z']
+        roll_rad = math.radians(vals['roll'])
+        pitch_rad = math.radians(vals['pitch'])
+        yaw_rad = math.radians(vals['yaw'])
+        jaw_width = vals['jaw']
+
+        rotmat = (rm.rotmat_from_euler(roll_rad, 0, 0) @
+                  rm.rotmat_from_euler(0, pitch_rad, 0) @
+                  rm.rotmat_from_euler(0, 0, yaw_rad))
+
+        jaw_center_pos = np.array([x, y, z])
+
+        current_jaw_width = jaw_width
+        current_jaw_center_pos = jaw_center_pos
+        current_jaw_center_rotmat = rotmat
+
+        if gripper_model is not None:
+            gripper_model.detach()
+        gripper_s.grip_at_by_pose(jaw_center_pos, rotmat, jaw_width)
+        gripper_model = gripper_s.gen_meshmodel(rgb=[0, 0, 1], alpha=0.8)
+        gripper_model.attach_to(base)
+
+    # ---------- 保存位姿 ----------
+    def output_pose(self):
+        global grasp_info_list, saved_models
+        print("\n===== 当前夹爪位姿 =====")
+        print(f"jaw_width  = {current_jaw_width:.4f}")
+        print(f"jaw_center_pos = {current_jaw_center_pos.tolist()}")
+        print("jaw_center_rotmat =")
+        print(current_jaw_center_rotmat)
+        print("========================")
+
+        # 保存抓取信息
+        hnd_pos = np.array([0, 0, 0])
+        hnd_rotmat = np.eye(3)
+        grasp_info = [current_jaw_width,
+                      current_jaw_center_pos.copy(),
+                      current_jaw_center_rotmat.copy(),
+                      hnd_pos,
+                      hnd_rotmat]
+        grasp_info_list.append(grasp_info)
+
+        with open(self.file_name, 'wb') as f:
+            pickle.dump(grasp_info_list, f)
+        print(f"已保存 {len(grasp_info_list)} 个抓取姿态到 {self.file_name}")
+
+        # 生成保存的位姿模型 (半透明灰色)
+        gripper_s.grip_at_by_pose(current_jaw_center_pos, current_jaw_center_rotmat, current_jaw_width)
+        save_model = gripper_s.gen_meshmodel(rgb=[0, 0, 0], alpha=0.1)
+        save_model.attach_to(base)
+        saved_models.append(save_model)   # 存储模型对象
+
+        self.status_label.config(text=f"已保存 {len(grasp_info_list)} 个姿态", fg="blue")
+
+    # ---------- 导入已有 pickle 中的抓取姿态 ----------
+    def import_poses(self):
+        global grasp_info_list, saved_models
+
+        file_path = filedialog.askopenfilename(
+            title="选择抓取姿态 pickle 文件",
+            filetypes=[("Pickle 文件", "*.pickle"), ("所有文件", "*.*")],
+            initialdir=os.path.dirname(os.path.abspath(self.file_name)) if self.file_name else ".",
+        )
+        if not file_path:
+            self.status_label.config(text="未选择文件", fg="red")
+            return
+
+        try:
+            with open(file_path, 'rb') as f:
+                loaded_list = pickle.load(f)
+        except Exception as e:
+            self.status_label.config(text=f"导入失败: {e}", fg="red")
+            return
+
+        if not isinstance(loaded_list, list):
+            self.status_label.config(text="文件格式不正确，应为列表", fg="red")
+            return
+
+        imported_count = 0
+        for grasp_info in loaded_list:
+            if len(grasp_info) < 3:
+                continue
+            jaw_width = grasp_info[0]
+            jaw_center_pos = np.asarray(grasp_info[1], dtype=np.float64)
+            jaw_center_rotmat = np.asarray(grasp_info[2], dtype=np.float64)
+
+            grasp_info_list.append(grasp_info)
+
+            # 生成半透明灰色模型并显示
+            gripper_s.grip_at_by_pose(jaw_center_pos, jaw_center_rotmat, jaw_width)
+            save_model = gripper_s.gen_meshmodel(rgb=[0, 0, 0], alpha=0.1)
+            save_model.attach_to(base)
+            saved_models.append(save_model)
+            imported_count += 1
+
+        # 保存合并后的列表到当前输出文件
+        with open(self.file_name, 'wb') as f:
+            pickle.dump(grasp_info_list, f)
+
+        self.status_label.config(
+            text=f"已导入 {imported_count} 个姿态（共 {len(grasp_info_list)} 个）",
+            fg="blue",
+        )
+        print(f"从 {file_path} 导入了 {imported_count} 个抓取姿态，当前共 {len(grasp_info_list)} 个")
+
+    # ---------- 重置 ----------
+    def reset(self):
+        initials = {'x':0.0, 'y':0.0, 'z':0.025, 'roll':0.0, 'pitch':0.0, 'yaw':90.0, 'jaw':0.1}
+        for key, val in initials.items():
+            self.var[key]['var'].set(val)
+            if key in ['roll', 'pitch', 'yaw']:
+                self.var[key]['entry_var'].set(f"{val:.1f}")
+            else:
+                self.var[key]['entry_var'].set(f"{val:.3f}")
+        self.update_gripper()
+        self.status_label.config(text="已重置", fg="green")
+
+    # ---------- 撤销 ----------
+    def undo_last(self):
+        global grasp_info_list, saved_models
+        if grasp_info_list and saved_models:
+            last_model = saved_models.pop()
+            last_model.detach()     # 从场景移除
+            grasp_info_list.pop()
+            self.status_label.config(
+                text=f"已撤销，剩余 {len(grasp_info_list)} 个姿态",
+                fg="orange"
+            )
+        else:
+            self.status_label.config(text="没有可撤销的姿态", fg="red")
+
+# ---------- Panda3D 更新任务 ----------
+def tk_update_task(task):
+    root.update()
+    return Task.cont
+
+# ---------- 主程序 ----------
+if __name__ == '__main__':
+    root = tk.Tk()
+    root.withdraw()
+
+    base = wd.World(cam_pos=[1, 1, 1], lookat_pos=[0, 0, 0])
+    mgm.gen_frame().attach_to(base)
+
+    # 加载物体 (瓶子)
+    this_dir, _ = os.path.split(__file__)
+    objpath = os.path.join(this_dir, "..", "models", "bottle.stl")
+    if not os.path.exists(objpath):
+        objpath = os.path.join(this_dir, "models", "bottle.STL")
+        if not os.path.exists(objpath):
+            print(f"错误: 找不到物体模型文件")
+            exit(1)
+    object_tube = cm.CollisionModel(objpath)
+    object_tube.rgba = rm.np.array([1, 1, 0, 0.8])
+    object_tube.attach_to(base)
+
+    gripper_s = dh.Dh76(fingertip_type = "r_76")
+
+    root.deiconify()
+    control = ControlWindow(root, file_name="result/bottle_dh76_neck_2_2.pickle")
+
+    # 键盘快捷键
+    base.accept('u', control.undo_last)
+
+    base.taskMgr.add(tk_update_task, "tk_update")
+    control.update_gripper()
+    base.run()

@@ -1,0 +1,15 @@
+{
+  "package_name": "visible_keypoints_obb4kpt_model",
+  "model_file": "model/best.pt",
+  "model_sha256": "bce43c2bcab4be15f90af7eee90b84fcc6fba579eb28e4fc2a4b354ac6a132fc",
+  "training_strategy": "All four keypoints are retained for clear targets. For occluded targets, only keypoints that are actually visible are retained.",
+  "input_size": 960,
+  "confidence_threshold": 0.528,
+  "nms_iou_threshold": 0.70,
+  "keypoint_visibility_threshold": 0.50,
+  "classes": {
+    "0": "occluded",
+    "1": "clear"
+  },
+  "keypoints": ["C", "N", "L", "B"]
+}

@@ -1,0 +1,39 @@
+{
+  "active_task": "manual_click",
+  "tasks": {
+    "manual_click": {
+      "mode": "manual_click",
+      "description": "Open the SAM prompt window and wait for manual clicks.",
+      "points": [],
+      "show_gui": true
+    },
+    "click_with_gui": {
+      "mode": "click_with_gui",
+      "description": "Use configured click points and show them in the SAM prompt window.",
+      "points": [],
+      "show_gui": true
+    },
+    "click_no_gui": {
+      "mode": "click_no_gui",
+      "description": "Run SAM directly with configured click points and no prompt window.",
+      "points": [],
+      "show_gui": false
+    }
+  },
+  "point_examples": [
+    {
+      "x": 650,
+      "y": 360,
+      "label": "fg"
+    },
+    {
+      "x": 900,
+      "y": 360,
+      "label": "bg"
+    }
+  ],
+  "point_labels": {
+    "fg": "foreground click, same as label 1",
+    "bg": "background click, same as label 0"
+  }
+}

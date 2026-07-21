@@ -1,0 +1,128 @@
+{
+  "object_summary_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\box_object_extraction_summary.json",
+  "bottle_transform_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_icp_transform.txt",
+  "box_transform_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\box_transform_used.txt",
+  "bottle_model_path": "D:\\code\\wrs_v2\\yanjiuyuan\\models\\bottle.stl",
+  "action_sequence_config": "D:\\code\\wrs_v2\\yanjiuyuan\\action_sequence_config.json",
+  "push_action_sequences": [
+    7,
+    9
+  ],
+  "planned": true,
+  "results": [
+    {
+      "action_sequence": 7,
+      "object_model_path": "D:\\code\\wrs_v2\\yanjiuyuan\\models\\bottle.stl",
+      "selected_grasp_index": 18,
+      "grasp_pickle_path": "D:\\code\\wrs_v2\\yanjiuyuan\\grasps\\bottle_dh76_push.pickle",
+      "path_type": "push",
+      "push_settings": {
+        "direction": [
+          0.0,
+          1.0,
+          0.0
+        ],
+        "distance": 0.05,
+        "lift_distance": 0.08,
+        "clearance_mode": "joint",
+        "clearance_jnt_values_deg": [
+          0.0,
+          -90.0,
+          90.0,
+          -90.0,
+          -90.0,
+          0.0
+        ],
+        "clearance_tcp_pos": null,
+        "open_after_push": true
+      },
+      "frame_count": 85,
+      "collision_obstacle_names": [
+        "table",
+        "detected_hollow_box_collision"
+      ],
+      "pick_pos": [
+        0.86386874,
+        -0.131163249,
+        0.089651932
+      ],
+      "pick_rotmat": [
+        [
+          0.045715977,
+          0.050692674,
+          -0.997667431
+        ],
+        [
+          0.041628172,
+          -0.997940754,
+          -0.04879904
+        ],
+        [
+          -0.998086742,
+          -0.039300176,
+          -0.04773208
+        ]
+      ],
+      "rtde_plan_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\push_rtde_plan_action_sequence_7.json",
+      "rtde_segment_count": 7,
+      "visualized_result": true
+    },
+    {
+      "action_sequence": 9,
+      "object_model_path": "D:\\code\\wrs_v2\\yanjiuyuan\\models\\bottle.stl",
+      "selected_grasp_index": 18,
+      "grasp_pickle_path": "D:\\code\\wrs_v2\\yanjiuyuan\\grasps\\bottle_dh76_push.pickle",
+      "path_type": "push",
+      "push_settings": {
+        "direction": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "distance": 0.05,
+        "lift_distance": 0.08,
+        "clearance_mode": "joint",
+        "clearance_jnt_values_deg": [
+          0.0,
+          -90.0,
+          90.0,
+          -90.0,
+          -90.0,
+          0.0
+        ],
+        "clearance_tcp_pos": null,
+        "open_after_push": true
+      },
+      "frame_count": 82,
+      "collision_obstacle_names": [
+        "table",
+        "detected_hollow_box_collision"
+      ],
+      "pick_pos": [
+        0.86386874,
+        -0.131163249,
+        0.089651932
+      ],
+      "pick_rotmat": [
+        [
+          0.045715977,
+          0.050692674,
+          -0.997667431
+        ],
+        [
+          0.041628172,
+          -0.997940754,
+          -0.04879904
+        ],
+        [
+          -0.998086742,
+          -0.039300176,
+          -0.04773208
+        ]
+      ],
+      "rtde_plan_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\push_rtde_plan_action_sequence_9.json",
+      "rtde_segment_count": 7,
+      "visualized_result": true
+    }
+  ]
+}

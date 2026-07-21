@@ -1,0 +1,79 @@
+{
+  "image": "D:\\code\\wrs_v2\\yanjiuyuan\\captures\\20260624-130254\\rgb.png",
+  "model": "yolo11n-seg.pt",
+  "classes_filter": "all",
+  "overlay_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\overlay.png",
+  "num_instances": 5,
+  "detections": [
+    {
+      "index": 0,
+      "class_id": 64,
+      "class_name": "mouse",
+      "confidence": 0.5196,
+      "bbox_xyxy": [
+        279.9200134277344,
+        100.98999786376953,
+        1046.280029296875,
+        563.2100219726562
+      ],
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\masks\\00_mouse_0.52_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\cutouts\\00_mouse_0.52_cutout.png"
+    },
+    {
+      "index": 1,
+      "class_id": 64,
+      "class_name": "mouse",
+      "confidence": 0.3854,
+      "bbox_xyxy": [
+        968.9400024414062,
+        139.07000732421875,
+        1655.3199462890625,
+        392.510009765625
+      ],
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\masks\\01_mouse_0.39_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\cutouts\\01_mouse_0.39_cutout.png"
+    },
+    {
+      "index": 2,
+      "class_id": 64,
+      "class_name": "mouse",
+      "confidence": 0.3142,
+      "bbox_xyxy": [
+        1025.8599853515625,
+        343.9800109863281,
+        1441.260009765625,
+        597.989990234375
+      ],
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\masks\\02_mouse_0.31_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\cutouts\\02_mouse_0.31_cutout.png"
+    },
+    {
+      "index": 3,
+      "class_id": 64,
+      "class_name": "mouse",
+      "confidence": 0.0798,
+      "bbox_xyxy": [
+        477.3900146484375,
+        555.4000244140625,
+        1487.77001953125,
+        1045.3299560546875
+      ],
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\masks\\03_mouse_0.08_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\cutouts\\03_mouse_0.08_cutout.png"
+    },
+    {
+      "index": 4,
+      "class_id": 76,
+      "class_name": "scissors",
+      "confidence": 0.0643,
+      "bbox_xyxy": [
+        184.97999572753906,
+        93.01000213623047,
+        1268.0400390625,
+        1170.550048828125
+      ],
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\masks\\04_scissors_0.06_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\ultralytics_seg_all_conf005\\cutouts\\04_scissors_0.06_cutout.png"
+    }
+  ]
+}

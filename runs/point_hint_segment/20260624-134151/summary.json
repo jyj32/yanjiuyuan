@@ -1,0 +1,164 @@
+{
+  "image": "D:\\code\\wrs_v2\\yanjiuyuan\\captures\\20260624-130254\\rgb.png",
+  "backend": "fastsam",
+  "model": "D:\\code\\wrs_v2\\FastSAM-s.pt",
+  "keep": "largest",
+  "points": [
+    {
+      "x": 1125,
+      "y": 778,
+      "label": 1
+    },
+    {
+      "x": 1030,
+      "y": 816,
+      "label": 1
+    },
+    {
+      "x": 1200,
+      "y": 721,
+      "label": 1
+    },
+    {
+      "x": 1307,
+      "y": 816,
+      "label": 1
+    },
+    {
+      "x": 1130,
+      "y": 879,
+      "label": 1
+    },
+    {
+      "x": 872,
+      "y": 598,
+      "label": 0
+    },
+    {
+      "x": 1149,
+      "y": 590,
+      "label": 0
+    },
+    {
+      "x": 1011,
+      "y": 572,
+      "label": 0
+    },
+    {
+      "x": 1251,
+      "y": 576,
+      "label": 0
+    },
+    {
+      "x": 1465,
+      "y": 602,
+      "label": 0
+    },
+    {
+      "x": 1515,
+      "y": 667,
+      "label": 0
+    },
+    {
+      "x": 1510,
+      "y": 764,
+      "label": 0
+    },
+    {
+      "x": 1510,
+      "y": 923,
+      "label": 0
+    },
+    {
+      "x": 1447,
+      "y": 1004,
+      "label": 0
+    },
+    {
+      "x": 1055,
+      "y": 1038,
+      "label": 0
+    },
+    {
+      "x": 783,
+      "y": 1042,
+      "label": 0
+    },
+    {
+      "x": 682,
+      "y": 1000,
+      "label": 0
+    },
+    {
+      "x": 713,
+      "y": 846,
+      "label": 0
+    },
+    {
+      "x": 764,
+      "y": 653,
+      "label": 0
+    },
+    {
+      "x": 739,
+      "y": 832,
+      "label": 1
+    },
+    {
+      "x": 701,
+      "y": 863,
+      "label": 1
+    },
+    {
+      "x": 619,
+      "y": 824,
+      "label": 1
+    },
+    {
+      "x": 909,
+      "y": 725,
+      "label": 1
+    },
+    {
+      "x": 1011,
+      "y": 671,
+      "label": 1
+    },
+    {
+      "x": 1307,
+      "y": 675,
+      "label": 1
+    },
+    {
+      "x": 1370,
+      "y": 846,
+      "label": 1
+    },
+    {
+      "x": 1314,
+      "y": 923,
+      "label": 1
+    },
+    {
+      "x": 1238,
+      "y": 986,
+      "label": 1
+    },
+    {
+      "x": 909,
+      "y": 935,
+      "label": 1
+    }
+  ],
+  "num_raw_masks": 15,
+  "num_saved_masks": 1,
+  "overlay_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-134151\\overlay.png",
+  "detections": [
+    {
+      "index": 0,
+      "area_px": 965200,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-134151\\masks\\00_area965200_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-134151\\cutouts\\00_area965200_cutout.png"
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "bottle_stl": "D:\\code\\wrs_v2\\yanjiuyuan\\models\\bottle.stl",
+  "template": "left",
+  "template_path": "D:\\code\\wrs_v2\\yanjiuyuan\\models\\bottle_left_view_points.ply",
+  "target_point_count": 99023,
+  "source_original_point_count": 28939,
+  "source_point_count": 2153,
+  "voxel_size": 0.005,
+  "template_voxel_size": 0.005,
+  "global_ransac_n": 3,
+  "global_ransac_attempts": 5,
+  "global_ransac_selected_attempt": 3,
+  "global_centroid_distance": 0.009928892200223203,
+  "model_sample_count": 10000,
+  "model_even_radius": null,
+  "icp_max_iteration": 80,
+  "global_fitness": 0.8611764705882353,
+  "global_inlier_rmse": 0.0035592603325990237,
+  "icp_fitness": 0.7661176470588236,
+  "icp_inlier_rmse": 0.0018711041118718468,
+  "source_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_template_left_points.ply",
+  "target_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\selected_object_icp_target_points.ply",
+  "global_registered_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_global_registered_points.ply",
+  "icp_registered_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_icp_registered_points.ply",
+  "registered_model_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_icp_registered_model.ply",
+  "global_transform_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_global_transform.txt",
+  "icp_transform_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_icp_transform.txt",
+  "global_transform": [
+    [
+      0.023215225146159507,
+      0.05752095126127285,
+      -0.9980743426656216,
+      0.8664282495255261
+    ],
+    [
+      0.02598098774607638,
+      -0.9980409331948085,
+      -0.056914707619169905,
+      -0.12998229632219932
+    ],
+    [
+      -0.9993928364748034,
+      -0.024609669514961907,
+      -0.02466419609906239,
+      0.0896720552826629
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "icp_transform": [
+    [
+      0.045715977233662594,
+      0.05069267388709379,
+      -0.9976674306800587,
+      0.8638687400565281
+    ],
+    [
+      0.04162817236920035,
+      -0.9979407542445172,
+      -0.04879903977627307,
+      -0.13116324926923545
+    ],
+    [
+      -0.9980867420674284,
+      -0.03930017598005003,
+      -0.047732080168013974,
+      0.08965193192011181
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "summary_path": "D:\\code\\wrs_v2\\yanjiuyuan\\box_object_extraction\\bottle_icp\\bottle_icp_summary.json"
+}

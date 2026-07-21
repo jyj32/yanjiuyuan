@@ -1,0 +1,48 @@
+{
+  "image": "D:\\code\\wrs_v2\\yanjiuyuan\\captures\\20260624-130254\\rgb.png",
+  "backend": "fastsam",
+  "model": "D:\\code\\wrs_v2\\FastSAM-s.pt",
+  "keep": "all",
+  "points": [
+    {
+      "x": 1050,
+      "y": 790,
+      "label": 1
+    }
+  ],
+  "num_raw_masks": 5,
+  "num_saved_masks": 5,
+  "overlay_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\overlay.png",
+  "detections": [
+    {
+      "index": 0,
+      "area_px": 81854,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\masks\\00_area81854_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\cutouts\\00_area81854_cutout.png"
+    },
+    {
+      "index": 1,
+      "area_px": 965200,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\masks\\01_area965200_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\cutouts\\01_area965200_cutout.png"
+    },
+    {
+      "index": 2,
+      "area_px": 268496,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\masks\\02_area268496_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\cutouts\\02_area268496_cutout.png"
+    },
+    {
+      "index": 3,
+      "area_px": 431442,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\masks\\03_area431442_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\cutouts\\03_area431442_cutout.png"
+    },
+    {
+      "index": 4,
+      "area_px": 964423,
+      "mask_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\masks\\04_area964423_mask.png",
+      "cutout_path": "D:\\code\\wrs_v2\\yanjiuyuan\\runs\\point_hint_segment\\20260624-133437\\cutouts\\04_area964423_cutout.png"
+    }
+  ]
+}
