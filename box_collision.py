@@ -1,4 +1,4 @@
-"""Concave collision helpers for the detected blue box.
+﻿"""Concave collision helpers for the detected blue box.
 
 The box is an open container. A single AABB makes the inner cavity solid, so
 planning must use separate collision panels for the bottom and four side walls.
@@ -156,10 +156,10 @@ def make_box_panel_specs(
     ]
 
 # 蓝色箱子碰撞体模型
-def make_hollow_box_cdprim(name="hollow_box_cdprim", ex_radius=-0.005):
+def make_hollow_box_cdprim(name="hollow_box_cdprim", ex_radius=-0.001):
 
     pdcnd = CollisionNode(name + "_cnode")
-    Lx, Ly, Lz = 0.6, 0.4, 0.26 # 箱子高度原长0.23m
+    Lx, Ly, Lz = 0.6, 0.4, 0.28 # 箱子高度原长0.23m
     t = 0.01  # 壁厚
     # 底面
     pdcnd.addSolid(CollisionBox(Point3(0, 0, t / 2), x=Lx / 2 + ex_radius, y=Ly / 2 + ex_radius, z=t / 2 + ex_radius))

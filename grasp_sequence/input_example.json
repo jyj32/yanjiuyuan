@@ -1,0 +1,39 @@
+{
+  "scene_id": "scene_example_0001",
+  "rgb_path": "data/scene_example_0001/rgb.png",
+  "depth_path": "data/scene_example_0001/depth_mm.npy",
+  "objects": [
+    {
+      "instance_id": 1,
+      "obb_corners_px": [
+        [320.0, 180.0],
+        [430.0, 190.0],
+        [420.0, 520.0],
+        [310.0, 510.0]
+      ],
+      "keypoints": {
+        "C": {"xy_px": [370.0, 350.0], "point_visible": 1},
+        "N": {"xy_px": [375.0, 205.0], "point_visible": 1},
+        "L": {"xy_px": [330.0, 350.0], "point_visible": 1},
+        "B": {"xy_px": [365.0, 500.0], "point_visible": 1}
+      },
+      "occlusion_state": 0
+    },
+    {
+      "instance_id": 2,
+      "obb_corners_px": [
+        [560.0, 240.0],
+        [655.0, 225.0],
+        [690.0, 510.0],
+        [590.0, 525.0]
+      ],
+      "keypoints": {
+        "C": {"xy_px": [625.0, 370.0], "point_visible": 1},
+        "N": {"xy_px": [607.0, 250.0], "point_visible": 1},
+        "L": {"xy_px": [585.0, 380.0], "point_visible": 0},
+        "B": {"xy_px": [640.0, 505.0], "point_visible": 1}
+      },
+      "occlusion_state": 1
+    }
+  ]
+}

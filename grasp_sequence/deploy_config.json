@@ -1,0 +1,23 @@
+{
+  "version_name": "第一版本_完整优先级排序",
+  "mode": "full_ranking",
+  "train_manifest": "datasets/version_1_full_ranking.jsonl",
+  "eval_manifest": "datasets/version_1_full_ranking.jsonl",
+  "pretrained_weights": "yolo11s.pt",
+  "run_dir": "runs/version_1_full_ranking",
+  "annotation_combined_sha256": "88a8ead1a5e76603a96a42c6ac342123dc00b3030778de31c6a42867fadbcaf0",
+  "image_size": 960,
+  "batch_size": 4,
+  "workers": 2,
+  "epochs": 150,
+  "patience": 30,
+  "freeze_rgb_epochs": 10,
+  "backbone_lr": 0.0001,
+  "new_layers_lr": 0.001,
+  "weight_decay": 0.0005,
+  "lambda_top1": 1.0,
+  "depth_near_mm": 900.0,
+  "depth_far_mm": 1400.0,
+  "amp": true,
+  "seed": 20260725
+}

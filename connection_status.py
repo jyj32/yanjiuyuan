@@ -223,6 +223,7 @@ def capture_mech_eye_pointcloud_checked(
     save_ply: bool = True,
     return_pixel_indices: bool = False,
     return_rgb: bool = False,
+    return_depth: bool = False,
     save_rgb: bool = True,
     camera: object = None,
 ): # 梅卡曼德相机拍照函数
@@ -296,13 +297,14 @@ def capture_mech_eye_pointcloud_checked(
             print("Warning: captured point cloud has no color data.")
         if colored_ply_path is not None:
             o3d.io.write_point_cloud(str(colored_ply_path), pcd, write_ascii=False)
-        if return_pixel_indices and return_rgb:
-            return pcd, rgb_path, colored_ply_path, camera_status, pixel_indices, rgb
+        base = (pcd, rgb_path, colored_ply_path, camera_status)
         if return_pixel_indices:
-            return pcd, rgb_path, colored_ply_path, camera_status, pixel_indices
+            base = base + (pixel_indices,)
         if return_rgb:
-            return pcd, rgb_path, colored_ply_path, camera_status, rgb
-        return pcd, rgb_path, colored_ply_path, camera_status
+            base = base + (rgb,)
+        if return_depth:
+            base = base + (depth,)
+        return base
     finally:
         if owns_camera and camera is not None:
             close_camera_quietly(camera)

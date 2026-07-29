@@ -20,13 +20,14 @@ import copy
 import json
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
 import open3d as o3d
 import cv2
 import numpy as np
+import torch
 from PIL import Image, ImageDraw
 import wrs.visualization.panda.world as wd
 from wrs.visualization.panda import panda3d_utils as pdu
@@ -83,10 +84,18 @@ from yanjiuyuan.mech_eye_ur7e_pointcloud_env import (  # noqa: E402
     numpy_to_open3d_pointcloud,
     transform_points,
 )
-from yanjiuyuan import point_hint_segment as phs
 import wrs.modeling.geometric_model as mgm
 from panda3d.core import Point3, Vec3
 import traceback
+import utils
+from yanjiuyuan.yolo_detect2 import BottleDetector
+import yanjiuyuan.point_hint_segment as phs
+import wrs.visualization.panda.world as wd
+from direct.gui.OnscreenText import OnscreenText
+from panda3d.core import TextNode, Notify
+from yanjiuyuan import sim_pick_and_place as sim_pick
+from yanjiuyuan.get_grasp_sequence import rank_detections_by_priority
+from yanjiuyuan import real_pipeline_planning
 
 @dataclass
 class PipelineContext:
@@ -104,7 +113,9 @@ class PipelineContext:
     pixel_indices: np.ndarray
     mapped_points: np.ndarray
     auto_box: Optional[tuple[int, int, int, int]]
-
+    # 逐物体的「周围点云（场景减去该物体）」内存对象，key=物体序号 obj_idx。
+    # 在 run_seg_icp_grasp 的循环里按物体写入，推开阶段直接取用，避免重新读盘。
+    remaining_pcd_by_obj: dict = field(default_factory=dict)
 
 @dataclass
 class CaptureData:
@@ -116,9 +127,9 @@ class CaptureData:
     rgb_path: Optional[Path]
     capture_dir: Path
     frame: str
+    depth: Optional[np.ndarray] = None
     pixel_indices: Optional[np.ndarray] = None
     rgb_image_bgr: Optional[np.ndarray] = None
-
 
 @dataclass
 class BoxLocalBounds:
@@ -126,7 +137,6 @@ class BoxLocalBounds:
     xy_max: np.ndarray
     z_min: float
     z_max: float
-
 
 @dataclass
 class ExtractionMasks:
@@ -136,9 +146,6 @@ class ExtractionMasks:
     selected: np.ndarray
     mask_projected: np.ndarray
     mapped_points: np.ndarray
-
-
-
 
 BOTTLE_ICP_CONFIG_FIELDS = {
     "bottle_icp": "enabled",
@@ -172,7 +179,6 @@ BOTTLE_ICP_CLI_FLAGS = {
     "bottle_icp_max_iteration": "--bottle-icp-max-iteration",
 }
 
-
 def default_bottle_icp_values() -> dict[str, object]:
     # 返回ICP配置的默认值字典，用于填充解析器参数。
 
@@ -181,7 +187,6 @@ def default_bottle_icp_values() -> dict[str, object]:
         option_name: getattr(config, config_field)
         for option_name, config_field in BOTTLE_ICP_CONFIG_FIELDS.items()
     }
-
 
 def bottle_icp_config_from_runtime_options(source: object, overrides: Optional[dict[str, object]] = None) -> bottle_pose.BottleIcpPoseConfig:
     config = bottle_pose.default_bottle_icp_config()
@@ -200,7 +205,6 @@ def bottle_icp_config_from_runtime_options(source: object, overrides: Optional[d
             setattr(config, config_field, value)
     return config
 
-
 def add_bottle_icp_arguments(parser: argparse.ArgumentParser) -> None:
     defaults = default_bottle_icp_values()
     parser.add_argument("--bottle-icp", action=argparse.BooleanOptionalAction, default=defaults["bottle_icp"], help="Register bottle.stl to the selected object points and draw the result.")
@@ -217,7 +221,6 @@ def add_bottle_icp_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bottle-model-even-radius", type=float, default=defaults["bottle_model_even_radius"])
     parser.add_argument("--bottle-icp-max-iteration", type=int, default=defaults["bottle_icp_max_iteration"])
 
-
 def append_bottle_icp_cli_args(cmd: list[str], source: object) -> None:
     for option_name in BOTTLE_ICP_ARG_NAMES:
         if not hasattr(source, option_name):
@@ -230,7 +233,6 @@ def append_bottle_icp_cli_args(cmd: list[str], source: object) -> None:
             cmd.append(flag if value else f"--no-{flag[2:]}")
         else:
             cmd.extend([flag, str(value)])
-
 
 def add_completion_matching_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--completion-matching", action=argparse.BooleanOptionalAction, default=True, help="After SAM point selection, complete the selected point cloud with AdaPoinTr, then run surface template ICP.")
@@ -253,14 +255,12 @@ def add_completion_matching_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--completion-selected-outlier-std-ratio", type=float, default=1.8)
     parser.add_argument("--completion-selected-outlier-min-keep-ratio", type=float, default=0.65)
 
-
 def add_completion_bottle_icp_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--completion-bottle-icp", action=argparse.BooleanOptionalAction, default=True, help="After AdaPoinTr completion, use selected+completed for global registration and selected-only for ICP.")
     parser.add_argument("--completion-bottle-template", choices=("surface", "top", "front", "left", "right", "custom"), default="surface", help="Bottle template for selected+completed pose estimation. Defaults to the full surface template.")
     parser.add_argument("--completion-bottle-template-ply", type=Path, default=None, help="Custom template PLY when --completion-bottle-template custom.")
     parser.add_argument("--completion-bottle-target-voxel-size", type=float, default=0.003, help="Voxel size for downsampling selected/completed target points before bottle ICP; <=0 disables.")
     parser.add_argument("--completion-bottle-template-voxel-size", type=float, default=0.003, help="Voxel size for bottle template downsampling before ICP; keep small to preserve geometry; <=0 disables.")
-
 
 def completion_template_path_from_runtime_options(source: object) -> Path:
     template_name = getattr(source, "completion_template", "surface")
@@ -272,7 +272,6 @@ def completion_template_path_from_runtime_options(source: object) -> Path:
             raise ValueError("--completion-template custom requires --completion-template-ply.")
         return Path(custom_path)
     raise ValueError(f"Unknown completion template: {template_name}")
-
 
 def completion_matching_config_from_runtime_options(source: object, output_dir: Path) -> completion_matching.CompletionMatchingConfig:
     return completion_matching.CompletionMatchingConfig(
@@ -296,7 +295,6 @@ def completion_matching_config_from_runtime_options(source: object, output_dir: 
         selected_outlier_min_keep_ratio=float(source.completion_selected_outlier_min_keep_ratio),
     )
 
-
 def completion_bottle_icp_config_from_runtime_options(source: object) -> bottle_pose.BottleIcpPoseConfig:
     template_name = getattr(source, "completion_bottle_template", "surface")
     template_ply = getattr(source, "completion_bottle_template_ply", None)
@@ -315,10 +313,8 @@ def completion_bottle_icp_config_from_runtime_options(source: object) -> bottle_
         raise ValueError("--completion-bottle-template custom requires --completion-bottle-template-ply.")
     return config
 
-
 def log(message: str) -> None:
     print(message, flush=True)
-
 
 @contextmanager
 def timed_step(name: str):
@@ -330,7 +326,6 @@ def timed_step(name: str):
         log(f"[box_object] FAILED {name} after {perf_counter() - start_time:.2f}s")
         raise
     log(f"[box_object] DONE {name} in {perf_counter() - start_time:.2f}s")
-
 
 # 使用 argparse 解析命令行参数，涵盖捕获目录、点云文件、提示点、掩膜、盒体变换、裁剪参数、瓶体 ICP、AdaPoinTr 补全等所有可配置项。
 def parse_args() -> argparse.Namespace:
@@ -354,6 +349,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-conf", type=float, default=0.528, help="YOLO 置信度阈值（最终过滤）")
     parser.add_argument("--yolo-iou", type=float, default=0.70, help="YOLO NMS IoU 阈值")
     parser.add_argument("--no-yolo", action="store_true", help="禁用 YOLO 检测，回退到原有 point_hint_segment 流程")
+    # ---- 抓取顺序优先级推理模型（grasp_sequence）----
+    parser.add_argument("--priority-order", action=argparse.BooleanOptionalAction, default=True, help="用 grasp_sequence 顺序推理模型对 YOLO 检测候选重排，再按优先级顺序做 SAM 分割（默认开）。")
+    parser.add_argument("--priority-checkpoint", type=Path, default=Path(__file__).parent / "grasp_sequence" / "best.pt", help="优先级模型权重")
+    parser.add_argument("--priority-config", type=Path, default=Path(__file__).parent / "grasp_sequence" / "deploy_config.json", help="优先级部署配置")
+    parser.add_argument("--priority-yolo", type=Path, default=Path(__file__).parent / "grasp_sequence" / "yolo11s.pt", help="YOLO11s 主干初始化权重")
+    parser.add_argument("--priority-device", default="auto", help="auto/cpu/cuda")
+    parser.add_argument("--priority-show", action=argparse.BooleanOptionalAction, default=False,
+                        help="展示优先级顺序可视化：在 YOLO 检测图上标注 rank 编号/OBB/分数并弹窗（默认关）。")
     parser.add_argument("--keep", choices=("best", "all", "largest", "smallest", "combined"), default="best")
     parser.add_argument("--imgsz", type=int, default=1024)
     parser.add_argument("--conf", type=float, default=0.25)
@@ -385,19 +388,17 @@ def parse_args() -> argparse.Namespace:
     add_completion_bottle_icp_arguments(parser)
     parser.set_defaults(bottle_icp=False)
     parser.add_argument("--point-size", type=float, default=BOX_OBJECT_POINT_SIZE)
+    parser.add_argument("--run-grasp", action=argparse.BooleanOptionalAction, default=True, help="Run the full seg-icp-grasp pipeline (YOLO→SAM→completion→ICP→plan) and animate the result in Panda3D. Use --no-run-grasp for interactive viewer.")
     return parser.parse_args()
-
 
 def resolve_path(path: Path) -> Path:
     # 把相对路径转为绝对路径
     return (Path.cwd() / path).resolve() if not path.is_absolute() else path.resolve()
 
-
 def transform_open3d_pointcloud(pcd, homomat: np.ndarray):
     pcd_copy = copy.deepcopy(pcd)
     pcd_copy.transform(homomat)
     return pcd_copy
-
 
 def open3d_to_numpy_keep_order(pcd) -> tuple[np.ndarray, Optional[np.ndarray]]:
     points = np.asarray(pcd.points, dtype=np.float64)
@@ -409,7 +410,6 @@ def open3d_to_numpy_keep_order(pcd) -> tuple[np.ndarray, Optional[np.ndarray]]:
     if len(points) == 0:
         raise RuntimeError("Point cloud is empty.")
     return points, colors
-
 
 def resolve_capture(args: argparse.Namespace) -> CaptureData:
     # 解析命令行指定的捕获目录或 PLY 文件，加载点云（世界坐标系），确定帧类型（camera/world），返回 CaptureData 对象。
@@ -424,6 +424,18 @@ def resolve_capture(args: argparse.Namespace) -> CaptureData:
     rgb_path = resolve_path(args.image) if args.image is not None else capture_dir / "rgb.png"
     if not rgb_path.exists():
         raise FileNotFoundError(f"RGB image not found: {rgb_path}")
+    # 加载对齐深度图（mm，与 RGB 同分辨率），供顺序推理模型使用；缺失则跳过（优先级回退面积顺序）
+    depth_arr = None
+    depth_path = capture_dir / "depth.npy"
+    if depth_path.exists():
+        try:
+            depth_arr = np.load(str(depth_path)).astype(np.float32)
+            log(f"[box_object] 加载深度图 (mm): {depth_path} shape={depth_arr.shape}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"[box_object] 深度图加载失败，跳过: {exc}")
+            depth_arr = None
+    else:
+        log(f"[box_object] 未找到深度图 {depth_path}，优先级模型将回退到面积顺序")
     pcd = load_ply_pointcloud(ply_path)
     points, colors = open3d_to_numpy_keep_order(pcd)
     if frame == "camera":
@@ -439,13 +451,11 @@ def resolve_capture(args: argparse.Namespace) -> CaptureData:
     log(f"[box_object] target_ply: {ply_path} ({frame})")
     log(f"[box_object] rgb_path: {rgb_path}")
     log(f"[box_object] raw points: {len(points_world)}")
-    return CaptureData(pcd_world, points_world, colors, ply_path, camera_ply, rgb_path, capture_dir, frame)
-
+    return CaptureData(pcd_world, points_world, colors, ply_path, camera_ply, rgb_path, capture_dir, frame, depth=depth_arr)
 
 def default_output_dir(capture_dir: Path) -> Path:
     # 基于捕获目录生成默认输出目录
     return resolve_path(Path(BOX_OBJECT_OUTPUT_DIR)) if BOX_OBJECT_OUTPUT_DIR is not None else capture_dir / "box_object_extraction"
-
 
 def candidate_transform_paths(capture_dir: Path) -> list[Path]:
     # 返回可能存放盒体变换文件的路径列表
@@ -454,7 +464,6 @@ def candidate_transform_paths(capture_dir: Path) -> list[Path]:
         capture_dir / "box_icp" / "box_obb_icp_transform.txt",
         capture_dir / "box_icp" / "box_icp_transform.txt",
     ]
-
 
 def load_box_transform(args: argparse.Namespace, capture: CaptureData, output_dir: Path) -> tuple[np.ndarray, Path, bool]:
     # 尝试从指定文件或候选路径加载盒体变换矩阵
@@ -475,7 +484,6 @@ def load_box_transform(args: argparse.Namespace, capture: CaptureData, output_di
     path = output_dir / "detected_box_transform.txt"
     np.savetxt(path, transform, fmt="%.9f")
     return transform, path, True
-
 
 def detect_box_transform_from_pointcloud(world_pcd) -> np.ndarray:
     # 从点云中检测蓝盒姿态：裁剪、滤波、聚类、下采样，然后通过 OBB+ICP 匹配盒体模板，返回变换矩阵。
@@ -503,7 +511,7 @@ def detect_box_transform_from_pointcloud(world_pcd) -> np.ndarray:
         return np.asarray(obb_initial_transform, dtype=np.float64)
     return np.asarray(icp_result.transformation, dtype=np.float64)
 
-
+# 箱子内部可放置物体的几何区域
 def compute_box_local_bounds() -> BoxLocalBounds:
     x_min, x_max = BOX_OBJECT_CONCAVE_X_RANGE
     y_min, y_max = BOX_OBJECT_CONCAVE_Y_RANGE
@@ -522,24 +530,20 @@ def compute_box_local_bounds() -> BoxLocalBounds:
     )
     return bounds
 
-
 def transform_world_to_box_local(points_world: np.ndarray, box_transform: np.ndarray) -> np.ndarray:
     inv_transform = np.linalg.inv(box_transform)
     points_h = np.column_stack((points_world, np.ones(len(points_world))))
     return (inv_transform @ points_h.T).T[:, :3]
-
 
 def colors_to_u8(colors: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if colors is None:
         return None
     return np.clip(np.rint(colors * 255.0), 0, 255).astype(np.uint8)
 
-
 def blue_box_color_mask(colors: Optional[np.ndarray]) -> np.ndarray:
     if colors is None:
         return np.zeros(0, dtype=bool)
     return np.asarray(box_icp.blue_color_mask(np.clip(colors, 0.0, 1.0)), dtype=bool)
-
 
 def compute_geometric_candidate_masks(
     points_world: np.ndarray,
@@ -548,6 +552,7 @@ def compute_geometric_candidate_masks(
     bounds: BoxLocalBounds,
     args: argparse.Namespace,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
     points_local = transform_world_to_box_local(points_world, box_transform)
     x, y, z = points_local[:, 0], points_local[:, 1], points_local[:, 2]
     region_min = bounds.xy_min + args.inner_xy_margin
@@ -623,17 +628,14 @@ def compute_geometric_candidate_masks(
     )
     return points_local, box_region, candidate, removed
 
-
 def load_rgb_image_rgb(image_path: Path) -> np.ndarray:
     return np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
-
 
 def load_mask_image(mask_path: Path, image_shape: tuple[int, int]) -> np.ndarray:
     mask = Image.open(mask_path).convert("L")
     if mask.size != (image_shape[1], image_shape[0]):
         mask = mask.resize((image_shape[1], image_shape[0]), resample=Image.Resampling.NEAREST)
     return np.asarray(mask, dtype=np.uint8) > 0
-
 
 def build_pixel_to_point_indices_by_color_sequence(image_rgb: np.ndarray, point_colors_u8: np.ndarray, tolerance: int) -> np.ndarray:
     flat_rgb = image_rgb.reshape(-1, 3).astype(np.int16)
@@ -651,7 +653,6 @@ def build_pixel_to_point_indices_by_color_sequence(image_rgb: np.ndarray, point_
         if cursor >= len(flat_rgb) and point_idx < len(point_colors) - 1:
             break
     return pixel_indices
-
 
 def resolve_pixel_indices_for_capture(
     capture: CaptureData,
@@ -693,7 +694,6 @@ def resolve_pixel_indices_for_capture(
         )
     return pixel_indices, mapped_points, mapped_ratio
 
-
 def bbox_from_pixel_indices(pixel_indices: np.ndarray, mask: np.ndarray, width: int, height: int) -> Optional[tuple[int, int, int, int]]:
     valid = pixel_indices[mask]
     valid = valid[valid >= 0]
@@ -709,11 +709,9 @@ def bbox_from_pixel_indices(pixel_indices: np.ndarray, mask: np.ndarray, width: 
         min(height - 1, int(ys.max()) + pad),
     )
 
-
 # yolo目标检测水平框
 def format_segment_box(box: Optional[tuple[int, int, int, int]]) -> Optional[str]:
     return None if box is None else ",".join(str(int(v)) for v in box)
-
 
 def obb_corners_to_bbox(corners_px: list[list[float]]) -> tuple[int, int, int, int]:
     """从 OBB 四角点计算轴对齐水平框 (x1, y1, x2, y2)。"""
@@ -721,6 +719,41 @@ def obb_corners_to_bbox(corners_px: list[list[float]]) -> tuple[int, int, int, i
     ys = [p[1] for p in corners_px]
     return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
+# YOLO 关键点作为 SAM 前景点时的可见度阈值（与 BottleDetector 默认 0.5 一致）
+YOLO_KEYPOINT_VIS_THRESHOLD = 0.5
+
+def yolo_keypoints_to_sam_points(
+    detection: dict,
+    width: int,
+    height: int,
+    fallback_point: Optional[tuple[int, int]] = None,
+) -> list[tuple[int, int, int]]:
+    """把 YOLO 检测到的关键点转换为 SAM 的前景输入点。
+
+    detection 需包含 ``keypoints_px`` 字段，格式为 ``[[x, y, vis], ...]``
+    （vis 为可见度，0~1，名称顺序 C/N/L/B）。仅保留可见度高于阈值的关键点，
+    并裁剪到图像范围内，避免越界导致 SAM 索引错误。
+
+    若没有任何可见关键点且提供了 ``fallback_point``（例如 bbox 中心点），
+    则回退到该点，保证 SAM 至少有一个前景点。
+    """
+    kpts = detection.get("keypoints_px") or []
+    points: list[tuple[int, int, int]] = []
+    for kp in kpts:
+        if len(kp) < 3:
+            continue
+        x, y, vis = float(kp[0]), float(kp[1]), float(kp[2])
+        if vis < YOLO_KEYPOINT_VIS_THRESHOLD:
+            continue
+        px = int(min(max(round(x), 0), width - 1))
+        py = int(min(max(round(y), 0), height - 1))
+        points.append((px, py, 1))  # label=1 表示前景
+    if not points and fallback_point is not None:
+        fx, fy = fallback_point
+        px = int(min(max(round(fx), 0), width - 1))
+        py = int(min(max(round(fy), 0), height - 1))
+        points.append((px, py, 1))
+    return points
 
 def point_hint_result_to_mask_summary(
     phs,
@@ -769,7 +802,6 @@ def point_hint_result_to_mask_summary(
     }
     return selected_masks[0] > 0, summary
 
-
 def run_or_load_point_hint_mask(
     args: argparse.Namespace,
     image_path: Optional[Path],
@@ -777,8 +809,23 @@ def run_or_load_point_hint_mask(
     auto_box: Optional[tuple[int, int, int, int]],
     image_bgr: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, Optional[Path], Optional[dict]]:
-    # SAM 2D 分割（YOLO 检测瓶子水平框 → SAM 掩码分割）
-
+    """
+    SAM 分割输出掩码（箱拣瓶流水线第一步）。
+    输入:
+        args: 含 mask / backend / model / point / segment_box / auto_segment_box 等配置
+        image_path: RGB 图文件路径（image_bgr 为 None 时使用）
+        output_dir: 输出目录（仅用于构造逻辑 image 路径）
+        auto_box: YOLO 检测到的候选框 (x1,y1,x2,y2)，启用 auto_segment_box 时作为 SAM 框提示
+        image_bgr: 内存中的 RGB(OpenCV BGR) 图，优先于 image_path
+    输出:
+        (mask_image, mask_path, summary):
+            mask_image: 与图像同尺寸的二值掩码，圈出目标物体
+            mask_path: 若直接加载已有 mask 则为文件路径，否则为 None（程序化分割只留内存）
+            summary: SAM 返回的元信息（检测结果列表等），无则为 None
+    说明: 优先加载 args.mask 指定掩码；否则用 YOLO 框/命令行点作为提示跑 SAM；
+          不再打开人工标点 GUI。
+    """
+    # 读取图像
     if image_bgr is not None:
         image_bgr = np.asarray(image_bgr, dtype=np.uint8)
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -796,135 +843,9 @@ def run_or_load_point_hint_mask(
             raise FileNotFoundError(f"Mask image not found: {mask_path}")
         return load_mask_image(mask_path, image_shape), mask_path, None
 
-    # ============ YOLO 瓶子检测 → bbox 喂给 SAM ============
-    use_yolo = not getattr(args, "no_yolo", False)
-    if use_yolo:
-        yolo_model_key = str(args.yolo_model)
-        yolo_detector = getattr(args, "_yolo_detector", None)
-        if yolo_detector is None or getattr(args, "_yolo_model_key", None) != yolo_model_key:
-            yolo_detector = BottleDetector(
-                model_path=str(args.yolo_model),
-            )
-            # CLI 参数覆盖默认阈值（conf 用于 _parse_result 最终过滤）
-            yolo_detector.conf = args.yolo_conf
-            setattr(args, "_yolo_detector", yolo_detector)
-            setattr(args, "_yolo_model_key", yolo_model_key)
-        else:
-            log("[box_object] 复用已加载的 YOLO 模型")
-        # yolo OBB 检测
-        detections = yolo_detector.detect(image_bgr, show=True, save=False)
-        if not detections:
-            log("[box_object] YOLO 未检测到瓶子，回退到 point_hint_segment 流程")
-            use_yolo = False
-        else:
-            # OBB 四角点 → 轴对齐水平框，供 SAM box prompt 使用
-            for d in detections:
-                d["bbox"] = obb_corners_to_bbox(d["corners_px"])
-
-            # 如果有 auto_box（箱子内候选区域的2D投影），只保留与箱子区域重叠的瓶子
-            if auto_box is not None:
-                ab_x1, ab_y1, ab_x2, ab_y2 = auto_box
-
-                def _overlap_ratio(bbox):
-                    bx1, by1, bx2, by2 = bbox
-                    ix1 = max(bx1, ab_x1)
-                    iy1 = max(by1, ab_y1)
-                    ix2 = min(bx2, ab_x2)
-                    iy2 = min(by2, ab_y2)
-                    if ix1 >= ix2 or iy1 >= iy2:
-                        return 0.0
-                    inter = (ix2 - ix1) * (iy2 - iy1)
-                    bbox_area = max((bx2 - bx1) * (by2 - by1), 1)
-                    return inter / bbox_area
-
-                in_box = [d for d in detections if _overlap_ratio(d["bbox"]) > 0.1]
-                if in_box:
-                    log(f"[box_object] YOLO 检测到 {len(detections)} 个瓶子，"
-                        f"{len(in_box)} 个在箱子区域内")
-                    detections = in_box
-                else:
-                    log(f"[box_object] YOLO 检测到 {len(detections)} 个瓶子，"
-                        f"但都不在箱子区域内，回退到 point_hint_segment 流程")
-                    use_yolo = False
-
-        if use_yolo:
-            # 取面积最大的瓶子（detections 已按 class_id + obb_area 降序排列）
-            best = detections[0]
-            x1, y1, x2, y2 = best["bbox"]
-            log(f"[box_object] YOLO 选用: "
-                f"bbox=({x1},{y1})-({x2},{y2}), conf={best['confidence']:.3f}, "
-                f"area={best['obb_area']:.0f}, class={best['class_name']}")
-
-    if use_yolo:
-        # ---- 用 YOLO bbox 作为 SAM 的 box prompt ----
-
-        logical_image_path = image_path.resolve() if image_path is not None else (output_dir / "rgb_in_memory.png").resolve()
-        h, w = image_bgr.shape[:2]
-        yolo_box = phs.clamp_box((x1, y1, x2, y2), w, h)
-
-        # bbox 中心点作为前景 point prompt（SAM 要求至少一个前景点）
-        cx = int((x1 + x2) / 2)
-        cy = int((y1 + y2) / 2)
-        points = [(cx, cy, 1)]  # label=1 表示前景
-
-        # 加载 SAM 模型
-        sam_model_path = args.model or phs.default_model(args.backend)
-        model_key = (args.backend, str(sam_model_path))
-        model = getattr(args, "point_hint_model", None)
-        if model is None or getattr(args, "point_hint_model_key", None) != model_key:
-            model = phs.load_model(args.backend, sam_model_path)
-            setattr(args, "point_hint_model", model)
-            setattr(args, "point_hint_model_key", model_key)
-            log(f"[box_object] SAM 模型加载: backend={args.backend}, model={sam_model_path}")
-        else:
-            log("[box_object] 复用已加载的 SAM 模型")
-
-        log(f"[box_object] SAM box prompt: {yolo_box}, point: ({cx},{cy})")
-        result = phs.run_model(
-            model,
-            args.backend,
-            image_bgr,
-            points,
-            yolo_box,
-            args.imgsz,
-            args.conf,
-            args.iou,
-            args.device,
-        )
-
-        segment_args = argparse.Namespace(
-            image=logical_image_path,
-            backend=args.backend,
-            model=sam_model_path,
-            out_dir=(output_dir / "point_hint_segment").resolve(),
-            point=[f"{cx},{cy},1"],
-            box=format_segment_box(yolo_box),
-            keep=args.keep,
-            imgsz=args.imgsz,
-            conf=args.conf,
-            iou=args.iou,
-            device=args.device,
-            max_display=args.max_display,
-            no_gui=True,
-            show_gui_with_points=False,
-        )
-        mask_image, summary = point_hint_result_to_mask_summary(
-            phs,
-            result,
-            image_shape,
-            logical_image_path,
-            segment_args,
-            points,
-            yolo_box,
-        )
-        log("[box_object] YOLO+SAM 分割完成，mask 保留在内存中")
-        return mask_image, None, summary
-
-    # ============ 回退：原有 point_hint_segment 流程 ============
-
-
     segment_box = args.segment_box or (format_segment_box(auto_box) if args.auto_segment_box else None)
     logical_image_path = image_path.resolve() if image_path is not None else (output_dir / "rgb_in_memory.png").resolve()
+    # 参数配置
     segment_args = argparse.Namespace(
         image=logical_image_path,
         backend=args.backend,
@@ -939,7 +860,6 @@ def run_or_load_point_hint_mask(
         device=args.device,
         max_display=args.max_display,
         no_gui=args.no_gui,
-        show_gui_with_points=bool(getattr(args, "show_gui_with_points", False)),
     )
 
     h, w = image_bgr.shape[:2]
@@ -952,55 +872,46 @@ def run_or_load_point_hint_mask(
     model_key = (segment_args.backend, str(segment_args.model))
     model = getattr(args, "point_hint_model", None)
     if model is None or getattr(args, "point_hint_model_key", None) != model_key:
+        # 加载SAM模型
         model = phs.load_model(segment_args.backend, segment_args.model)
         setattr(args, "point_hint_model", model)
         setattr(args, "point_hint_model_key", model_key)
         log("[box_object] point_hint model loaded for this context")
     else:
         log("[box_object] reusing preloaded point_hint model")
-    show_gui_with_points = bool(getattr(segment_args, "show_gui_with_points", False))
     if points:
         log("[box_object] point_hint points: " + " ".join(f"--point {phs.format_point_hint(point)}" for point in points))
-    if show_gui_with_points and points and not segment_args.no_gui:
-        log("[box_object] point_hint GUI will show the configured points before segmentation.")
 
-    if segment_args.no_gui or (points and not show_gui_with_points):
-        if not points:
-            raise ValueError("--no-gui requires at least one --point, or use --mask.")
-        result = phs.run_model(
-            model,
-            segment_args.backend,
-            image_bgr,
-            points,
-            box,
-            segment_args.imgsz,
-            segment_args.conf,
-            segment_args.iou,
-            segment_args.device,
+    # 始终使用程序化 SAM 分割：点/框提示来自 YOLO 检测（auto_box）或命令行 args，
+    # 不再打开交互窗口人工标点。
+    if not points and box is None:
+        raise ValueError(
+            "SAM 分割需要至少一个 --point 或一个 box 提示："
+            "启用 --auto-segment-box 由 YOLO 提供框，或用 --mask 直接加载已有掩码。"
         )
-        mask_image, summary = point_hint_result_to_mask_summary(
-            phs,
-            result,
-            image_shape,
-            logical_image_path,
-            segment_args,
-            points,
-            box,
-        )
-        log("[box_object] point_hint mask kept in memory; no mask/cutout/overlay images written.")
-        return mask_image, None, summary
-    else:
-        session = phs.InteractiveSession(segment_args, image_bgr, model)
-        summary = session.run()
-
-    if not summary or not summary.get("detections"):
-        raise RuntimeError("point_hint_segment.py did not save any mask. Add foreground points, press 's', then press 'q'.")
-    mask_path_value = summary["detections"][0].get("mask_path")
-    if not mask_path_value:
-        raise RuntimeError("point_hint_segment returned a summary without a saved mask path.")
-    mask_path = Path(mask_path_value)
-    return load_mask_image(mask_path, image_shape), mask_path, summary
-
+    # SAM模型运行
+    result = phs.run_model(
+        model,
+        segment_args.backend,
+        image_bgr,
+        points,
+        box,
+        segment_args.imgsz,
+        segment_args.conf,
+        segment_args.iou,
+        segment_args.device,
+    )
+    mask_image, summary = point_hint_result_to_mask_summary(
+        phs,
+        result,
+        image_shape,
+        logical_image_path,
+        segment_args,
+        points,
+        box,
+    )
+    log("[box_object] point_hint mask kept in memory; no mask/cutout/overlay images written.")
+    return mask_image, None, summary
 
 def apply_2d_mask_to_points(
     mask_image: np.ndarray,
@@ -1019,7 +930,6 @@ def apply_2d_mask_to_points(
     )
     return selected, mask_projected
 
-
 def voxel_downsample_arrays(points: np.ndarray, colors: Optional[np.ndarray], voxel_size: Optional[float]):
     if voxel_size is None or voxel_size <= 0 or len(points) == 0:
         return points, colors
@@ -1032,8 +942,6 @@ def voxel_downsample_arrays(points: np.ndarray, colors: Optional[np.ndarray], vo
     out_points = np.asarray(pcd.points, dtype=np.float64)
     out_colors = np.asarray(pcd.colors, dtype=np.float64) if pcd.has_colors() else None
     return out_points, out_colors
-
-
 
 def save_registered_bottle_template_pointclouds(
     bottle_summary: dict,
@@ -1060,7 +968,6 @@ def save_registered_bottle_template_pointclouds(
         "icp_registered_path": str(icp_registered_path),
         "registered_template_point_count": int(len(source_pcd.points)),
     }
-
 
 def run_completion_bottle_icp_on_selected_and_completed(
     selected_points_world: np.ndarray,
@@ -1221,7 +1128,6 @@ def local_points_to_world(points_local: np.ndarray, homomat: np.ndarray) -> np.n
     points_h = np.column_stack((points_local, np.ones(len(points_local))))
     return (homomat @ points_h.T).T[:, :3]
 
-
 def make_concave_region_lineset(bounds: BoxLocalBounds, box_transform: np.ndarray):
 
     x0, y0, z0 = bounds.xy_min[0], bounds.xy_min[1], bounds.z_min
@@ -1249,8 +1155,6 @@ def make_concave_region_lineset(bounds: BoxLocalBounds, box_transform: np.ndarra
     line_set.colors = o3d.utility.Vector3dVector(np.tile(color, (len(lines), 1)))
     return line_set, corners_world
 
-
-
 def make_transformed_box_mesh(box_transform: np.ndarray):
 
     if not BOX_MODEL_PATH.exists():
@@ -1264,7 +1168,6 @@ def make_transformed_box_mesh(box_transform: np.ndarray):
     mesh.paint_uniform_color([0.55, 0.82, 1.0])
     mesh.transform(box_transform)
     return mesh
-
 
 def read_ascii_ply_points(ply_path: Path) -> np.ndarray:
     with ply_path.open("r", encoding="ascii") as file:
@@ -1285,7 +1188,6 @@ def read_ascii_ply_points(ply_path: Path) -> np.ndarray:
             points.append([float(values[0]), float(values[1]), float(values[2])])
     return np.asarray(points, dtype=np.float64)
 
-
 def load_template_points_for_preview(ply_path: Path) -> np.ndarray:
     ply_path = resolve_path(ply_path)
     try:
@@ -1296,7 +1198,6 @@ def load_template_points_for_preview(ply_path: Path) -> np.ndarray:
     except ImportError:
         pass
     return read_ascii_ply_points(ply_path)
-
 
 def project_template_points_for_preview(points: np.ndarray, template_name: str) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
@@ -1326,7 +1227,6 @@ def project_template_points_for_preview(points: np.ndarray, template_name: str) 
         projected = rotated[:, [0, 2]]
     return projected
 
-
 def draw_preview_text(image: np.ndarray, text: str, origin: tuple[int, int], scale: float = 0.55) -> None:
     try:
         cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (35, 35, 35), 1, cv2.LINE_AA)
@@ -1341,7 +1241,6 @@ def draw_preview_text(image: np.ndarray, text: str, origin: tuple[int, int], sca
         image[:] = np.asarray(pil_image)
     except ImportError:
         return
-
 
 def make_template_preview_tile(template_name: str, points: np.ndarray, tile_size: int, index: int) -> np.ndarray:
     tile_size = int(max(180, tile_size))
@@ -1382,7 +1281,6 @@ def make_template_preview_tile(template_name: str, points: np.ndarray, tile_size
         image[:, -1, :] = 120
     return image
 
-
 def save_rgb_image(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1391,7 +1289,6 @@ def save_rgb_image(path: Path, image: np.ndarray) -> None:
     except ImportError:
         pass
     Image.fromarray(image).save(path)
-
 
 def build_bottle_template_prompt_image(output_dir: Path, config: bottle_pose.BottleIcpPoseConfig):
     preview_dir = output_dir / "bottle_template_previews"
@@ -1434,7 +1331,6 @@ def build_bottle_template_prompt_image(output_dir: Path, config: bottle_pose.Bot
     log(f"[box_object] saved bottle template prompt image: {grid_path}")
     return canvas, templates, rects, grid_path
 
-
 def choose_bottle_template_from_console(templates: list[dict], grid_path: Path) -> str:
     print(f"Bottle template preview image: {grid_path}")
     for display_idx, item in enumerate(templates, start=1):
@@ -1452,7 +1348,6 @@ def choose_bottle_template_from_console(templates: list[dict], grid_path: Path) 
     if selected_idx < 0 or selected_idx >= len(templates):
         selected_idx = 0
     return templates[selected_idx]["name"]
-
 
 def choose_bottle_template_with_prompt(output_dir: Path, config: bottle_pose.BottleIcpPoseConfig) -> str:
     image, templates, rects, grid_path = build_bottle_template_prompt_image(output_dir, config)
@@ -1597,7 +1492,6 @@ def show_pointclouds(summary: dict) -> None:
     log("[box_object] Viewer colors: red=selected object, green=kept candidate points, gray=removed/context points, cyan wireframe=concave region, purple=global registered template points, yellow mesh=registered bottle.STL, original-color=remaining point cloud (original minus bottle mask).")
     o3d.visualization.draw_geometries(geometries, window_name="box object point cloud + bottle ICP", width=1280, height=720)
 
-
 def show_pointcloud(ply_path: Path) -> None:
     # 单独展示点云图
     pcd = o3d.io.read_point_cloud(str(ply_path))
@@ -1612,12 +1506,10 @@ def show_pointcloud(ply_path: Path) -> None:
         height=720,
     )
 
-
 def prepare_pipeline_context(args: argparse.Namespace) -> PipelineContext:
     with timed_step("resolve/load saved capture"):
         capture = resolve_capture(args)
     return prepare_pipeline_context_from_capture(args, capture)
-
 
 def prepare_pipeline_context_from_capture(args: argparse.Namespace, capture: CaptureData) -> PipelineContext:
     output_dir = resolve_path(args.output_dir) if args.output_dir is not None else default_output_dir(capture.capture_dir)
@@ -1674,15 +1566,116 @@ def prepare_pipeline_context_from_capture(args: argparse.Namespace, capture: Cap
         auto_box=auto_box,
     )
 
-def run_segmentation_and_bottle_icp_attempt(ctx: PipelineContext) -> tuple[dict, ExtractionMasks, np.ndarray]:
-    # yolo检测→分割→点云补全→ICP匹配
+def save_remaining_pointcloud_around_object(
+    *,
+    mask_image: np.ndarray,
+    selected_mask: np.ndarray,
+    ctx: "PipelineContext",
+    summary: dict,
+    kernel_size: int = 15,
+    expand_m: float = 0.03,
+    voxel_size: float = 0.005,
+    save_ply: bool = True,  # 是否保存物体周围的剩余点云
+) -> tuple[Optional[Path], "o3d.geometry.PointCloud"]:
+    """生成（并可选保存）"物体周围的剩余点云"。
+
+    从原始点云中剔除物体掩码对应的点（对 2D 掩码做膨胀填洞并投影回 3D），
+    再对掩码取最小外接旋转矩形并向外扩大 expand_m 米以限制在物体附近区域，
+    体素下采样得到剩余点云。
+
+    Args:
+        save_ply: 为 True 时写出 remaining_pointcloud.ply 并把路径写回 summary
+            （供可视化 / 兜底读盘）；为 False 时仅返回内存对象、不落盘。
+
+    Returns:
+        (remaining_ply_path_or_None, downsampled_pointcloud)
+    """
+    # 对2D物体掩码进行膨胀填洞
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))   # 创建结构元素。形状是椭圆形，大小是 kernel_size x kernel_size
+    mask_image_closed = cv2.morphologyEx(mask_image.astype(np.uint8), cv2.MORPH_DILATE, kernel) # 只膨胀
+    mask_image_closed = mask_image_closed.astype(bool)
+    log(f"[box_object] Mask closing (dilate, kernel={kernel_size}): "
+        f"before={int(mask_image.sum())}, after={int(mask_image_closed.sum())}")
+    # 将填洞后的2D掩码重新投影到3D点云
+    flat_mask_closed = mask_image_closed.reshape(-1)
+    closed_projected = np.zeros(len(ctx.pixel_indices), dtype=bool)
+    mapped = (ctx.pixel_indices >= 0) & (ctx.pixel_indices < len(flat_mask_closed))
+    closed_projected[mapped] = flat_mask_closed[ctx.pixel_indices[mapped]]
+    closed_selected = ctx.candidate_mask & closed_projected
+    log(f"[box_object] Closed mask projected to 3D: selected={int(closed_selected.sum())} "
+        f"(original selected={int(selected_mask.sum())})")
+    # 用填洞后的掩码计算剩余点云
+    remaining_mask = ~closed_selected
+    # 对掩码取最小外接旋转矩形，扩大后投影回3D过滤远点
+    mask_uint8 = mask_image_closed.astype(np.uint8)
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        all_contour_pts = np.vstack(contours)
+        rect = cv2.minAreaRect(all_contour_pts)  # (center, (w, h), angle)
+        rect_w, rect_h = rect[1]
+        # 估算像素→米的比例：用物体3D外接盒XY尺寸 / 2D矩形尺寸
+        object_points = ctx.capture.points_world[closed_selected]
+        obj_3d_extent = np.ptp(object_points[:, :2], axis=0)  # XY平面上的尺寸 [dx, dy]
+        ref_3d = max(obj_3d_extent[0], obj_3d_extent[1])
+        ref_2d = max(rect_w, rect_h)
+        meters_per_pixel = ref_3d / ref_2d if ref_2d > 0 else 0.001
+        expand_px = max(1, int(round(expand_m / meters_per_pixel)))
+        # 扩大矩形
+        new_rect = (rect[0], (rect_w + 2 * expand_px, rect_h + 2 * expand_px), rect[2])
+        expanded_box = np.intp(cv2.boxPoints(new_rect))
+        # 创建扩大矩形的2D掩码
+        rect_mask_img = np.zeros(mask_image_closed.shape, dtype=np.uint8)
+        cv2.fillPoly(rect_mask_img, [expanded_box], 1)
+        # 投影回3D
+        flat_rect_mask = rect_mask_img.reshape(-1)
+        rect_projected = np.zeros(len(ctx.pixel_indices), dtype=bool)
+        mapped_r = (ctx.pixel_indices >= 0) & (ctx.pixel_indices < len(flat_rect_mask))
+        rect_projected[mapped_r] = flat_rect_mask[ctx.pixel_indices[mapped_r]].astype(bool)
+        # 只保留在扩大矩形内且不在物体掩码内的点
+        final_mask = remaining_mask & rect_projected
+        log(f"[box_object] MinAreaRect expand (rect=({rect_w:.0f}x{rect_h:.0f}px, "
+            f"expand={expand_m}m={expand_px}px, m/px={meters_per_pixel:.5f}): "
+            f"remaining={int(remaining_mask.sum())}, in_rect={int(final_mask.sum())}")
+    else:
+        final_mask = remaining_mask
+        log("[box_object] No contour found, skip rect filter")
+    # 生成剩余点云
+    remaining_points = ctx.capture.points_world[final_mask]
+    remaining_pcd = o3d.geometry.PointCloud()
+    remaining_pcd.points = o3d.utility.Vector3dVector(remaining_points)
+    if ctx.capture.colors is not None:
+        remaining_colors = ctx.capture.colors[final_mask]
+        if remaining_colors.shape[1] == 4:
+            remaining_colors = remaining_colors[:, :3]
+        remaining_pcd.colors = o3d.utility.Vector3dVector(np.clip(remaining_colors, 0.0, 1.0))
+    # 体素下采样，减少点数使点云稀疏
+    down_pcd = remaining_pcd.voxel_down_sample(voxel_size)
+    log(f"[box_object] Voxel downsample (voxel_size={voxel_size}m): "
+        f"before={len(remaining_pcd.points)}, after={len(down_pcd.points)}")
+    if save_ply:
+        remaining_ply_path = ctx.output_dir / "remaining_pointcloud.ply"
+        o3d.io.write_point_cloud(str(remaining_ply_path), down_pcd, write_ascii=False) # type:ignore
+        summary["remaining_pointcloud_path"] = str(remaining_ply_path)
+        Path(summary["summary_path"]).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        log(f"[box_object] Saved remaining point cloud (rect-expanded, downsampled): {remaining_ply_path} ({len(down_pcd.points)} points)")
+        return remaining_ply_path, down_pcd
+    log(f"[box_object] save_ply=False: 仅返回内存点云，不落盘 ({len(down_pcd.points)} points)")
+    return None, down_pcd
+
+def run_segmentation_and_bottle_icp_attempt(
+    ctx: PipelineContext,
+    *,
+    obj_idx: Optional[int] = None,
+) -> tuple[dict, ExtractionMasks, np.ndarray]:
+    # (单个物体)分割→点云补全→ICP匹配
     attempt_args = copy.copy(ctx.args)
+    attempt_args._priority_depth = getattr(ctx.capture, "depth", None)
     total_start = perf_counter()
     segmentation_start = perf_counter()
     bottle_config = bottle_icp_config_from_runtime_options(attempt_args)
     # 分割
     with timed_step("run/load point_hint_segment mask"):    # 1.47s
-        # yolo检测+sam分割
+        # 只有sam分割，没有yolo检测
         mask_image, mask_path, point_hint_summary = run_or_load_point_hint_mask(
             attempt_args,
             ctx.capture.rgb_path,
@@ -1721,77 +1714,16 @@ def run_segmentation_and_bottle_icp_attempt(ctx: PipelineContext) -> tuple[dict,
         )
     # 输出去除物体掩码对应的点云后的剩余点云
     with timed_step("save remaining point cloud (original minus bottle mask)"): # 大约0.05s
-        # 对2D物体掩码进行闭运算（膨胀再腐蚀）填洞
-        kernel_size = 15    # 核大小，改大→填更大的洞，改小→只填小洞
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))   # 创建结构元素。形状是椭圆形，大小是 kernel_size x kernel_size
-        # mask_image_closed = cv2.morphologyEx(mask_image.astype(np.uint8), cv2.MORPH_CLOSE, kernel)  # 对掩码图像执行形态学闭运算,先膨胀后腐蚀
-        mask_image_closed = cv2.morphologyEx(mask_image.astype(np.uint8), cv2.MORPH_DILATE, kernel) # 只膨胀
-        mask_image_closed = mask_image_closed.astype(bool)
-        log(f"[box_object] Mask closing (dilate+erode, kernel={kernel_size}): "
-            f"before={int(mask_image.sum())}, after={int(mask_image_closed.sum())}")
-        # 将填洞后的2D掩码重新投影到3D点云
-        flat_mask_closed = mask_image_closed.reshape(-1)
-        closed_projected = np.zeros(len(ctx.pixel_indices), dtype=bool)
-        mapped = (ctx.pixel_indices >= 0) & (ctx.pixel_indices < len(flat_mask_closed))
-        closed_projected[mapped] = flat_mask_closed[ctx.pixel_indices[mapped]]
-        closed_selected = ctx.candidate_mask & closed_projected
-        log(f"[box_object] Closed mask projected to 3D: selected={int(closed_selected.sum())} "
-            f"(original selected={int(selected_mask.sum())})")
-        # 用填洞后的掩码计算剩余点云
-        remaining_mask = ~closed_selected
-        # 对掩码取最小外接旋转矩形，扩大后投影回3D过滤远点
-        mask_uint8 = mask_image_closed.astype(np.uint8)
-        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            all_contour_pts = np.vstack(contours)
-            rect = cv2.minAreaRect(all_contour_pts)  # (center, (w, h), angle)
-            rect_w, rect_h = rect[1]
-            # 估算像素→米的比例：用物体3D外接盒XY尺寸 / 2D矩形尺寸
-            object_points = ctx.capture.points_world[closed_selected]
-            obj_3d_extent = np.ptp(object_points[:, :2], axis=0)  # XY平面上的尺寸 [dx, dy]
-            ref_3d = max(obj_3d_extent[0], obj_3d_extent[1])
-            ref_2d = max(rect_w, rect_h)
-            meters_per_pixel = ref_3d / ref_2d if ref_2d > 0 else 0.001
-            expand_m = 0.025  # 每边扩大2.5cm（长宽各加5cm）
-            expand_px = max(1, int(round(expand_m / meters_per_pixel)))
-            # 扩大矩形
-            new_rect = (rect[0], (rect_w + 2 * expand_px, rect_h + 2 * expand_px), rect[2])
-            expanded_box = np.intp(cv2.boxPoints(new_rect))
-            # 创建扩大矩形的2D掩码
-            rect_mask_img = np.zeros(mask_image_closed.shape, dtype=np.uint8)
-            cv2.fillPoly(rect_mask_img, [expanded_box], 1)
-            # 投影回3D
-            flat_rect_mask = rect_mask_img.reshape(-1)
-            rect_projected = np.zeros(len(ctx.pixel_indices), dtype=bool)
-            mapped_r = (ctx.pixel_indices >= 0) & (ctx.pixel_indices < len(flat_rect_mask))
-            rect_projected[mapped_r] = flat_rect_mask[ctx.pixel_indices[mapped_r]].astype(bool)
-            # 只保留在扩大矩形内且不在物体掩码内的点
-            final_mask = remaining_mask & rect_projected
-            log(f"[box_object] MinAreaRect expand (rect=({rect_w:.0f}x{rect_h:.0f}px, "
-                f"expand={expand_m}m={expand_px}px, m/px={meters_per_pixel:.5f}): "
-                f"remaining={int(remaining_mask.sum())}, in_rect={int(final_mask.sum())}")
-        else:
-            final_mask = remaining_mask
-            log("[box_object] No contour found, skip rect filter")
-        # 生成剩余点云
-        remaining_points = ctx.capture.points_world[final_mask]
-        remaining_pcd = o3d.geometry.PointCloud()
-        remaining_pcd.points = o3d.utility.Vector3dVector(remaining_points)
-        if ctx.capture.colors is not None:
-            remaining_colors = ctx.capture.colors[final_mask]
-            if remaining_colors.shape[1] == 4:
-                remaining_colors = remaining_colors[:, :3]
-            remaining_pcd.colors = o3d.utility.Vector3dVector(np.clip(remaining_colors, 0.0, 1.0))
-        # 体素下采样，减少点数使点云稀疏
-        voxel_size = 0.01  # 体素边长(米)，改大→更稀疏，改小→更密集
-        down_pcd = remaining_pcd.voxel_down_sample(voxel_size)
-        log(f"[box_object] Voxel downsample (voxel_size={voxel_size}m): "
-            f"before={len(remaining_pcd.points)}, after={len(down_pcd.points)}")
-        remaining_ply_path = ctx.output_dir / "remaining_pointcloud.ply"
-        o3d.io.write_point_cloud(str(remaining_ply_path), down_pcd, write_ascii=False) # type:ignore
-        summary["remaining_pointcloud_path"] = str(remaining_ply_path)
-        Path(summary["summary_path"]).write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        log(f"[box_object] Saved remaining point cloud (rect-expanded, downsampled): {remaining_ply_path} ({len(down_pcd.points)} points)")
+        remaining_ply_path, down_pcd = save_remaining_pointcloud_around_object(
+            mask_image=mask_image,
+            selected_mask=selected_mask,
+            ctx=ctx,
+            summary=summary,
+            save_ply=True,  # 是否保存点云
+        )
+        # 把内存点云按物体序号挂到 ctx，供后续（如推开阶段）直接取用，避免重新读盘。
+        if obj_idx is not None:
+            ctx.remaining_pcd_by_obj[obj_idx] = down_pcd
 
     if bottle_config.enabled and bottle_config.template == "prompt":
         with timed_step("choose bottle template after object segmentation"):
@@ -1865,6 +1797,616 @@ def run_segmentation_and_bottle_icp_attempt(ctx: PipelineContext) -> tuple[dict,
     print_summary(summary)
     return summary, masks, selected_mask
 
+# =====================================================================
+# 抓取顺序优先级推理（grasp_sequence / infer_priority）
+# 流程：YOLO 检测候选 → RGB-D 优先级网络 → 重排检测顺序 → 再按优先级进入 SAM 分割。
+# 复用 grasp_sequence 包的 letterbox / geometry 编码 / 数据加载逻辑，
+# 但直接从内存中的 RGB+深度推理，不落盘、不走 CLI。
+# =====================================================================
+_KEYPOINT_ORDER = ("C", "N", "L", "B")  # 与 BottleDetector.KEYPOINT_NAMES 一致
+_PRIORITY_MODEL_CACHE: dict = {}
+
+def _resolve_priority_device(requested: str) -> torch.device:
+    if requested == "auto":
+        requested = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
+    return device
+
+def _load_priority_model_cached(args):
+    """加载（并缓存）grasp_sequence 优先级模型，返回 (model, config, device, helpers, prototype)。"""
+    checkpoint = Path(getattr(args, "priority_checkpoint",
+                              Path(__file__).parent / "grasp_sequence" / "best.pt")).resolve()
+    config_path = Path(getattr(args, "priority_config",
+                               Path(__file__).parent / "grasp_sequence" / "deploy_config.json")).resolve()
+    yolo_path = Path(getattr(args, "priority_yolo",
+                             Path(__file__).parent / "grasp_sequence" / "yolo11s.pt")).resolve()
+    device_req = getattr(args, "priority_device", "auto")
+    key = (str(checkpoint), str(config_path), str(yolo_path))
+    cached = _PRIORITY_MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    from yanjiuyuan.grasp_sequence.priority_model import PriorityNetwork
+    from yanjiuyuan.grasp_sequence.priority_data import (
+        letterbox, geometry_from_quad_and_keypoints, transform_points,
+        move_batch, priority_collate,
+    )
+
+    for p in (checkpoint, config_path, yolo_path):
+        if not Path(p).is_file():
+            raise FileNotFoundError(p)
+    config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
+    mode = config.get("mode")
+    if mode not in ("full_ranking", "top1_only"):
+        raise ValueError(f"unsupported priority mode: {mode!r}")
+
+    ckpt = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+    ckpt_config = (ckpt.get("config") or {})
+    if ckpt_config.get("mode") != mode:
+        raise RuntimeError(f"checkpoint mode {ckpt_config.get('mode')!r} != config mode {mode!r}")
+    state_dict = ckpt.get("model")
+    if not isinstance(state_dict, dict):
+        raise RuntimeError("checkpoint does not contain a model state dict")
+
+    model = PriorityNetwork(str(yolo_path), int(config["image_size"]))
+    model.load_state_dict(state_dict, strict=True)
+    device = _resolve_priority_device(device_req)
+    model.to(device)
+    model.eval()
+
+    prototype = None
+    if mode == "top1_only":
+        proto = ckpt.get("prototype")
+        if proto is None:
+            raise RuntimeError("top1_only checkpoint does not contain prototype")
+        prototype = torch.nn.functional.normalize(
+            torch.as_tensor(proto, dtype=torch.float32, device=device), dim=0
+        )
+
+    helpers = {
+        "letterbox": letterbox,
+        "geometry_from_quad_and_keypoints": geometry_from_quad_and_keypoints,
+        "transform_points": transform_points,
+        "move_batch": move_batch,
+        "priority_collate": priority_collate,
+    }
+    result = (model, config, device, helpers, prototype)
+    _PRIORITY_MODEL_CACHE[key] = result
+    return result
+
+def _detection_to_priority_object(det: dict, instance_id: int) -> dict:
+    """把一个 YOLO detection 映射成优先级网络所需的 object 描述。"""
+    kpts_px = det.get("keypoints_px") or []
+    keypoints = {}
+    for name, p in zip(_KEYPOINT_ORDER, kpts_px):
+        if not p:
+            keypoints[name] = {"xy_px": [0.0, 0.0], "point_visible": 0.0}
+            continue
+        x, y, vis = float(p[0]), float(p[1]), float(p[2])
+        keypoints[name] = {"xy_px": [x, y], "point_visible": vis}
+    occlusion_state = 0 if int(det.get("class_id", 1)) == 1 else 1  # clear→0, occluded→1
+    return {
+        "instance_id": int(instance_id),
+        "obb_corners_px": det["corners_px"],
+        "keypoints": keypoints,
+        "occlusion_state": occlusion_state,
+    }
+
+def _build_priority_batch(rgb_bgr, depth_mm, objects, image_size, depth_near_mm, depth_far_mm, helpers):
+    """复用 priority_data 的 letterbox/geometry 变换，从内存 RGB+深度构造单场景 batch。"""
+    letterbox = helpers["letterbox"]
+    geometry_from_quad_and_keypoints = helpers["geometry_from_quad_and_keypoints"]
+    transform_points = helpers["transform_points"]
+
+    rgb = cv2.cvtColor(np.asarray(rgb_bgr, dtype=np.uint8), cv2.COLOR_BGR2RGB)
+    rgb_canvas, depth_canvas, scale, pad_x, pad_y = letterbox(rgb, depth_mm, image_size)
+    valid = np.isfinite(depth_canvas) & (depth_canvas > 0)
+    clipped = np.clip(
+        np.nan_to_num(depth_canvas, nan=0.0, posinf=0.0, neginf=0.0),
+        depth_near_mm, depth_far_mm,
+    )
+    depth_norm = np.zeros_like(depth_canvas, dtype=np.float32)
+    depth_norm[valid] = 0.05 + 0.95 * (clipped[valid] - depth_near_mm) / (depth_far_mm - depth_near_mm)
+
+    quads, keypoints, visibility, geometry, occlusion, instance_ids = [], [], [], [], [], []
+    for obj in objects:
+        quad = transform_points(np.asarray(obj["obb_corners_px"], dtype=np.float32), scale, pad_x, pad_y)
+        kpts, vis = [], []
+        for name in _KEYPOINT_ORDER:
+            kp = obj["keypoints"][name]
+            v = float(kp["point_visible"])
+            if v > 0.5:
+                xy = transform_points(np.asarray(kp["xy_px"], dtype=np.float32), scale, pad_x, pad_y)
+            else:
+                xy = np.zeros(2, dtype=np.float32)
+            kpts.append(xy)
+            vis.append(v)
+        kpts_arr = np.asarray(kpts, dtype=np.float32)
+        vis_arr = np.asarray(vis, dtype=np.float32)
+        quads.append(quad)
+        keypoints.append(kpts_arr)
+        visibility.append(vis_arr)
+        geometry.append(geometry_from_quad_and_keypoints(quad, kpts_arr, vis_arr, image_size))
+        occlusion.append(int(obj["occlusion_state"]))
+        instance_ids.append(int(obj["instance_id"]))
+
+    rgb_tensor = torch.from_numpy(np.ascontiguousarray(rgb_canvas.transpose(2, 0, 1))).float().div_(255.0)
+    depth_tensor = torch.from_numpy(np.ascontiguousarray(
+        np.stack((depth_norm, valid.astype(np.float32)), axis=0)))
+    sample = {
+        "rgb": rgb_tensor,
+        "depth": depth_tensor,
+        "quads": torch.from_numpy(np.asarray(quads, dtype=np.float32)),
+        "keypoints": torch.from_numpy(np.asarray(keypoints, dtype=np.float32)),
+        "visibility": torch.from_numpy(np.asarray(visibility, dtype=np.float32)),
+        "geometry": torch.from_numpy(np.asarray(geometry, dtype=np.float32)),
+        "ranks": torch.arange(len(quads), dtype=torch.long),
+        "instance_ids": torch.tensor(instance_ids, dtype=torch.long),
+        "occlusion": torch.tensor(occlusion, dtype=torch.long),
+        "scene_id": "scene_0",
+    }
+    return helpers["priority_collate"]([sample])
+
+def detect_and_rank(ctx: "PipelineContext", show: bool = True):
+    """统一入口：RGB 加载 → YOLO 检测 → bbox → auto_box 过滤 → 面积降序 → 优先级排序。
+
+    供 detect_bottles 与 run_seg_icp_grasp 共用，避免两处重复检测代码。
+    YOLO 未检测到任何物体时返回 None；否则返回 (image_bgr, h, w, detections)。
+    """
+    # ---- RGB 图像 (BGR) ----
+    if ctx.capture.rgb_image_bgr is not None:
+        image_bgr = np.asarray(ctx.capture.rgb_image_bgr, dtype=np.uint8)
+    elif ctx.capture.rgb_path is not None:
+        image_bgr = cv2.imread(str(ctx.capture.rgb_path), cv2.IMREAD_COLOR)
+        if image_bgr is None:
+            raise FileNotFoundError(f"Could not read RGB image: {ctx.capture.rgb_path}")
+    else:
+        raise RuntimeError("No RGB image available for YOLO detection.")
+    h, w = image_bgr.shape[:2]
+
+    # ---- YOLO 检测（懒加载，按模型路径缓存）----
+    yolo_model_key = str(ctx.args.yolo_model)
+    yolo_detector = getattr(ctx.args, "_yolo_detector", None)
+    if yolo_detector is None or getattr(ctx.args, "_yolo_model_key", None) != yolo_model_key:
+        yolo_detector = BottleDetector(model_path=str(ctx.args.yolo_model))
+        yolo_detector.conf = float(ctx.args.yolo_conf)
+        yolo_detector.iou = float(ctx.args.yolo_iou)
+        setattr(ctx.args, "_yolo_detector", yolo_detector)
+        setattr(ctx.args, "_yolo_model_key", yolo_model_key)
+    else:
+        log("[box_object] detect_and_rank: 复用 YOLO 模型")
+
+    detections = yolo_detector.detect(image_bgr, show=False, save=False)
+    if not detections:
+        log("[detect_and_rank] YOLO 未检测到任何物体")
+        return None
+
+    for d in detections:
+        d["bbox"] = obb_corners_to_bbox(d["corners_px"])
+
+    # 过滤：只保留与箱子区域重叠的检测结果
+    if ctx.auto_box is not None:
+        ab_x1, ab_y1, ab_x2, ab_y2 = ctx.auto_box
+
+        def _overlap_ratio(bbox):
+            bx1, by1, bx2, by2 = bbox
+            ix1, iy1, ix2, iy2 = max(bx1, ab_x1), max(by1, ab_y1), min(bx2, ab_x2), min(by2, ab_y2)
+            if ix1 >= ix2 or iy1 >= iy2:
+                return 0.0
+            return (ix2 - ix1) * (iy2 - iy1) / max((bx2 - bx1) * (by2 - by1), 1)
+
+        in_box = [d for d in detections if _overlap_ratio(d["bbox"]) > 0.1]
+        if in_box:
+            detections = in_box
+
+    # 按 OBB 面积降序（大物体优先）
+    detections.sort(key=lambda d: d.get("obb_area", 0), reverse=True)
+
+    # ---- 优先级排序：YOLO 输出 → 顺序推理模型 → 新检测顺序 ----
+    detections = rank_detections_by_priority(
+        image_bgr, getattr(ctx.capture, "depth", None), detections, ctx.args, show=show,
+    )
+    return image_bgr, h, w, detections
+
+
+def detect_bottles(ctx: "PipelineContext") -> tuple[np.ndarray, list[dict]]:
+    """对当前 ctx 的 RGB 图运行 YOLO 检测，返回 (image_bgr, detections)。
+
+    检测/排序逻辑由 detect_and_rank 统一实现；本函数仅做薄封装，
+    供交互模式按号码选取目标框。每个 detection 含 corners_px / bbox / class_name /
+    confidence / obb_area / keypoints_px 等字段。
+    YOLO 未检测到任何物体时返回 None（调用方需判断）。
+    """
+    res = detect_and_rank(ctx, show=True)
+    if res is None:
+        return None
+    image_bgr, _h, _w, detections = res
+    return image_bgr, detections
+
+def run_segmentation_and_bottle_icp_with_fallback(
+    ctx: PipelineContext,
+    skip_indices: set[int] | None = None,
+) -> tuple[dict, ExtractionMasks, np.ndarray]:
+    """遍历所有 YOLO 检测物体，逐个尝试 SAM→补全→ICP；首个成功即返回。
+
+    与 run_segmentation_and_bottle_icp_attempt 不同：后者只处理 YOLO 检测到的第一个（最大）
+    物体，失败即抛异常。本函数在物体失败时自动跳到下一个物体，直到某个物体 ICP 成功。
+    全部失败才抛异常。
+
+    skip_indices: 不处理的物体索引集合（基于 YOLO 检测排序后的 obj_idx），这些物体将被跳过。
+                  两种用途：(1) 交互模式按检测顺序处理时，只让当前顺序项不被跳过；
+                  (2) 路径规划失败后重试时，跳过已失败的物体。
+    """
+
+    # ============ YOLO 检测所有物体（复用 detect_bottles → detect_and_rank，保证与交互模式选框时排序一致）============
+    detected = detect_bottles(ctx)
+    if detected is None:
+        raise RuntimeError("YOLO 未检测到任何瓶子")
+    image_bgr, detections = detected
+    h, w = image_bgr.shape[:2]
+    log(f"[box_object] run_segmentation_and_bottle_icp_with_fallback: "
+        f"共 {len(detections)} 个候选物体，按面积降序尝试")
+    if skip_indices:
+        log(f"[box_object] 本轮只处理其余框；跳过框（YOLO 索引）: {sorted(skip_indices)}")
+
+    # ---- 保存原始 ctx 状态 ----
+    original_mask = getattr(ctx.args, "mask", None)
+    original_no_yolo = getattr(ctx.args, "no_yolo", False)
+    original_output_dir = ctx.output_dir
+
+    # 确保补全 + ICP 开启
+    ctx.args.bottle_icp = False
+    ctx.args.completion_matching = True
+    ctx.args.completion_bottle_icp = True
+    ctx.args.bottle_template = "surface"
+    ctx.args.bottle_template_prompt_gui = False
+    ctx.args.completion_bottle_template = "surface"
+
+    try:
+        for obj_idx, detection in enumerate(detections):
+            # 跳过指定物体：既用于交互模式按检测顺序只处理某个框，
+            # 也用于路径规划失败后重试时跳过已失败物体
+            if skip_indices is not None and obj_idx in skip_indices:
+                log(f"[box_object] === 跳过 框{obj_idx}（物体{obj_idx + 1}/{len(detections)}）：已在前面轮次处理，本轮不重复 ===")
+                continue
+            obj_label = f"物体{obj_idx + 1}/{len(detections)}"
+            bbox = detection["bbox"]
+            x1, y1, x2, y2 = bbox
+            log(f"[box_object] === 尝试 框{obj_idx}（{obj_label}）: bbox=({x1},{y1})-({x2},{y2}), "
+                f"conf={detection['confidence']:.3f}, area={detection.get('obb_area', 0):.0f} ===")
+
+            try:
+                # ---- SAM 分割 ----
+                yolo_box = phs.clamp_box((x1, y1, x2, y2), w, h)
+                cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                # 用 YOLO 检测到的关键点作为 SAM 前景输入点（可见关键点优先，中心回退）
+                points = yolo_keypoints_to_sam_points(detection, w, h, fallback_point=(cx, cy))
+
+                sam_model_path = ctx.args.model or phs.default_model(ctx.args.backend)
+                model_key = (ctx.args.backend, str(sam_model_path))
+                model = getattr(ctx.args, "point_hint_model", None)
+                if model is None or getattr(ctx.args, "point_hint_model_key", None) != model_key:
+                    model = phs.load_model(ctx.args.backend, sam_model_path)
+                    setattr(ctx.args, "point_hint_model", model)
+                    setattr(ctx.args, "point_hint_model_key", model_key)
+
+                result = phs.run_model(model, ctx.args.backend, image_bgr,
+                                       points, yolo_box,
+                                       ctx.args.imgsz, ctx.args.conf, ctx.args.iou, ctx.args.device)
+
+                image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+                image_shape = image_rgb.shape[:2]
+                logical_image_path = (ctx.capture.rgb_path.resolve()
+                                      if ctx.capture.rgb_path is not None
+                                      else (ctx.output_dir / "rgb_in_memory.png").resolve())
+                segment_args = argparse.Namespace(
+                    image=str(logical_image_path), backend=ctx.args.backend,
+                    model=sam_model_path,
+                    out_dir=(ctx.output_dir / f"det{obj_idx}" / "point_hint_segment").resolve(),
+                    point=[f"{x},{y},1" for (x, y, _) in points],
+                    box=format_segment_box(yolo_box),
+                    keep=ctx.args.keep, imgsz=ctx.args.imgsz,
+                    conf=ctx.args.conf, iou=ctx.args.iou, device=ctx.args.device,
+                    max_display=getattr(ctx.args, "max_display", 1400),
+                    no_gui=True, show_gui_with_points=False,
+                )
+                mask_image, _phs_summary = point_hint_result_to_mask_summary(
+                    phs, result, image_shape, logical_image_path, segment_args, points, yolo_box)
+                if mask_image is None or not np.any(mask_image):
+                    raise RuntimeError("SAM 分割未产生有效掩码")
+
+                # ---- 保存 mask ----
+                det_output_dir = ctx.output_dir / f"det{obj_idx}"
+                det_output_dir.mkdir(parents=True, exist_ok=True)
+                mask_path = det_output_dir / "yolo_sam_mask.png"
+                cv2.imwrite(str(mask_path), (np.asarray(mask_image, np.uint8) * 255))
+
+                # ---- 设置 ctx 并运行补全+ICP ----
+                ctx.args.mask = mask_path
+                ctx.args.no_yolo = True
+                ctx.output_dir = det_output_dir
+
+                summary, masks, selected_mask = run_segmentation_and_bottle_icp_attempt(ctx)
+
+                # 记录物体索引，供交互模式路径规划失败后跳过该物体
+                summary["obj_index"] = obj_idx
+                # 保存 YOLO OBB 检测列表（含 corners_px / keypoints_px），
+                # 供 CDPO 交互模式在 run_detection 中保存检测记录。
+                summary["detections"] = detections
+                # 记录 2D SAM 分割掩码图的磁盘路径（selected_mask 是 3D 点云掩码，
+                # 无法直接当 2D 图片保存），供 CDPO 模式保存检测记录时写入 mask.png。
+                summary["sam_mask_path"] = str(mask_path)
+                log(f"[box_object] {obj_label} 检测+补全+ICP 成功！")
+                return summary, masks, selected_mask
+
+            except Exception as exc:
+                log(f"[box_object] {obj_label} 失败: {exc}")
+                traceback.print_exc()
+                continue
+            finally:
+                ctx.args.mask = original_mask
+                ctx.args.no_yolo = original_no_yolo
+                ctx.output_dir = original_output_dir
+
+        raise RuntimeError(f"所有 {len(detections)} 个 YOLO 物体均未通过检测+补全+ICP")
+    finally:
+        ctx.args.mask = original_mask
+        ctx.args.no_yolo = original_no_yolo
+        ctx.output_dir = original_output_dir
+
+def run_seg_icp_grasp(ctx: PipelineContext, pipeline_module):
+    """yolo检测→分割→点云补全→ICP匹配→抓取姿态→路径规划，生成可执行的抓放路径。
+    用于循环抓取文件
+    遍历所有 YOLO 检测到的物体，对每个物体依次执行完整的感知-规划流水线。
+    某个物体在任何步骤失败时自动跳到下一个，直到某个物体成功生成 RTDE 执行计划。
+
+    生成的轨迹以 RTDE JSON 格式保存，可供
+    real_bottle_pick_place_interactive3_point_completion_with_yolo2.py 通过
+    rtde_utils.load_rtde_execution_plan(path) 加载并执行。
+
+    Returns:
+        成功时返回字典，包含 rtde_plan_path / summary / object_index / planning 等字段；
+        全部失败时返回 None。
+    """
+
+    # ---- 1. YOLO 检测所有物体（统一入口 detect_and_rank）----
+    with timed_step("YOLO 检测所有物体"):
+        res = detect_and_rank(ctx, show=False)
+        if res is None:
+            log("[run_seg_icp_grasp] YOLO 未检测到任何物体")
+            return None
+        image_bgr, h, w, detections = res
+        log(f"[run_seg_icp_grasp] YOLO 检测到 {len(detections)} 个物体，按优先级降序尝试")
+        # 把检测结果与逐物体 ICP 位姿挂到 ctx，供后续「推开阶段」复用（避免重新拍照 / 重复 YOLO）。
+        # 即使所有物体抓取规划均失败（run_seg_icp_grasp 返回 None），这些字段也已写入 ctx。
+        ctx.detections = detections
+        ctx.push_object_poses = {}
+        # 逐物体的「周围点云（场景减去该物体）」路径，供推开阶段按物体单独筛选候选。
+        # 每个物体的 remaining_pointcloud.ply 是在 run_segmentation_and_bottle_icp_attempt 内
+        # 按该物体的掩码裁剪得到的，互不相同，不能共用。
+        ctx.push_object_remaining_pcd = {}
+
+    # ---- 保存原始 ctx 状态 ----
+    original_mask = getattr(ctx.args, "mask", None)
+    original_no_yolo = getattr(ctx.args, "no_yolo", False)
+    original_output_dir = ctx.output_dir
+    original_bottle_icp = getattr(ctx.args, "bottle_icp", False)
+    original_completion_matching = getattr(ctx.args, "completion_matching", False)
+    original_completion_bottle_icp = getattr(ctx.args, "completion_bottle_icp", False)
+    original_bottle_template = getattr(ctx.args, "bottle_template", "surface")
+    original_bottle_template_prompt_gui = getattr(ctx.args, "bottle_template_prompt_gui", False)
+    original_completion_bottle_template = getattr(ctx.args, "completion_bottle_template", "surface")
+
+    # 确保补全 + ICP 开启
+    ctx.args.bottle_icp = False
+    ctx.args.completion_matching = True
+    ctx.args.completion_bottle_icp = True
+    ctx.args.bottle_template = "surface"
+    ctx.args.bottle_template_prompt_gui = False
+    ctx.args.completion_bottle_template = "surface"
+
+    try:
+        for obj_idx, detection in enumerate(detections):
+            obj_label = f"物体{obj_idx + 1}/{len(detections)}"
+            bbox = detection["bbox"]
+            x1, y1, x2, y2 = bbox
+            log(
+                f"[run_seg_icp_grasp] === 尝试 {obj_label}: "
+                f"bbox=({x1},{y1})-({x2},{y2}), conf={detection['confidence']:.3f}, "
+                f"area={detection.get('obb_area', 0):.0f}, class={detection.get('class_name', '?')} ==="
+            )
+
+            try:
+                # ---- 2a. SAM 分割 ----
+                with timed_step(f"{obj_label} SAM 分割"):
+                    sam_model_path = ctx.args.model or phs.default_model(ctx.args.backend)
+                    model_key = (ctx.args.backend, str(sam_model_path))
+                    model = getattr(ctx.args, "point_hint_model", None)
+                    if model is None or getattr(ctx.args, "point_hint_model_key", None) != model_key:
+                        model = phs.load_model(ctx.args.backend, sam_model_path)
+                        setattr(ctx.args, "point_hint_model", model)
+                        setattr(ctx.args, "point_hint_model_key", model_key)
+
+                    yolo_box = phs.clamp_box((x1, y1, x2, y2), w, h)
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+                    # 用 YOLO 检测到的关键点作为 SAM 前景输入点（可见关键点优先，中心回退）
+                    points = yolo_keypoints_to_sam_points(detection, w, h, fallback_point=(cx, cy))
+
+                    result = phs.run_model(
+                        model,
+                        ctx.args.backend,
+                        image_bgr,
+                        points,
+                        yolo_box,
+                        ctx.args.imgsz,
+                        ctx.args.conf,
+                        ctx.args.iou,
+                        ctx.args.device,
+                    )
+
+                    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+                    image_shape = image_rgb.shape[:2]
+                    logical_image_path = (
+                        ctx.capture.rgb_path.resolve()
+                        if ctx.capture.rgb_path is not None
+                        else (ctx.output_dir / "rgb_in_memory.png").resolve()
+                    )
+                    segment_args = argparse.Namespace(
+                        image=str(logical_image_path),
+                        backend=ctx.args.backend,
+                        model=sam_model_path,
+                        out_dir=(ctx.output_dir / f"det{obj_idx}" / "point_hint_segment").resolve(),
+                        point=[f"{x},{y},1" for (x, y, _) in points],
+                        box=format_segment_box(yolo_box),
+                        keep=ctx.args.keep,
+                        imgsz=ctx.args.imgsz,
+                        conf=ctx.args.conf,
+                        iou=ctx.args.iou,
+                        device=ctx.args.device,
+                        max_display=getattr(ctx.args, "max_display", 1400),
+                        no_gui=True,
+                        show_gui_with_points=False,
+                    )
+                    mask_image, _phs_summary = point_hint_result_to_mask_summary(
+                        phs,
+                        result,
+                        image_shape,
+                        logical_image_path,
+                        segment_args,
+                        points,
+                        yolo_box,
+                    )
+                    if mask_image is None or not np.any(mask_image):
+                        raise RuntimeError(f"{obj_label} SAM 分割未产生有效掩码")
+                    log(
+                        f"[run_seg_icp_grasp] {obj_label} SAM 分割完成: "
+                        f"mask 像素数={int(np.asarray(mask_image).sum())}"
+                    )
+
+                # ---- 2b. 保存 mask 并设置 ctx 用于后续流水线 ----
+                det_output_dir = original_output_dir / f"det{obj_idx}"
+                det_output_dir.mkdir(parents=True, exist_ok=True)
+                mask_path = det_output_dir / "yolo_sam_mask.png"
+                mask_uint8 = (np.asarray(mask_image, dtype=np.uint8) * 255)
+                cv2.imwrite(str(mask_path), mask_uint8)
+
+                ctx.args.mask = mask_path
+                ctx.args.no_yolo = True
+                ctx.output_dir = det_output_dir
+
+                # ---- 2c. 分割→补全→ICP ----
+                with timed_step(f"{obj_label} 分割→补全→ICP"):
+                    # 不再落盘 remaining_pointcloud.ply：内存点云按物体序号存入
+                    # ctx.remaining_pcd_by_obj[obj_idx]，抓取规划(2e)与推开阶段都直接取用、不重新读盘。
+                    summary, _masks, selected_mask = run_segmentation_and_bottle_icp_attempt(
+                        ctx, obj_idx=obj_idx)
+                    if summary is None:
+                        raise RuntimeError(f"{obj_label} 分割/补全/ICP 返回空 summary")
+                    log(f"[run_seg_icp_grasp] {obj_label} ICP 完成")
+
+                # ---- 2d. 提取 ObjectIcpResult ----
+                with timed_step(f"{obj_label} 提取物体位姿"):
+
+                    real_pipeline = pipeline_module
+                    icp_result = real_pipeline.object_icp_result_from_summary(summary)
+                    bottle_homomat = real_pipeline.bottle_homomat_for_icp(icp_result)
+                    pick_pose = utils.homomat_to_pose(bottle_homomat)
+                    # 记录该物体的 3D 位姿，供推开阶段按物体遍历候选 push 位姿时做「局部→基系」变换
+                    ctx.push_object_poses[obj_idx] = pick_pose
+                    # 注：物体专属的周围点云（场景减去该物体）不再落盘，
+                    # 直接存于内存 ctx.remaining_pcd_by_obj[obj_idx]，供抓取规划(2e)与推开阶段取用。
+                    log(
+                        f"[run_seg_icp_grasp] {obj_label} 位姿: "
+                        f"pos=[{pick_pose[0][0]:.4f}, {pick_pose[0][1]:.4f}, {pick_pose[0][2]:.4f}]"
+                    )
+
+                # ---- 2e. 生成抓取+路径规划 ----
+                with timed_step(f"{obj_label} 路径规划"):
+                    plan_args = real_pipeline.make_runtime_config()
+                    plan_args.skip_plan = False
+                    plan_args.dry_run = True  # 不在 run_seg_icp_grasp 中可视化
+                    plan_args.object_model = None  # 使用 icp_result 中的模型路径
+                    plan_args.object_output_dir = det_output_dir
+                    # 不再设置 plan_args.remaining_pointcloud_path：改为把内存点云
+                    # ctx.remaining_pcd_by_obj[obj_idx] 直接传给 run_or_skip_plan（免读盘）。
+                    plan_args.box_transform = str(icp_result.box_transform_path)
+                    plan_args.grasp_pickle = real_pipeline.DEFAULT_GRASP_PICKLE_PATH
+                    plan_args.box_obstacle = True
+                    plan_args.no_env = False
+                    plan_args.use_rrt = True
+                    plan_args.visualize_failure = False
+                    plan_args.execute_dry_run = False
+                    # 传递真实机器人起始关节角（如果有）
+                    start_conf_deg = getattr(ctx.args, "start_conf_deg", None)
+                    if start_conf_deg is not None:
+                        plan_args.start_conf_deg = start_conf_deg
+
+                    planning = real_pipeline_planning.run_or_skip_plan(
+                        plan_args, icp_result,
+                        remaining_pcd=ctx.remaining_pcd_by_obj.get(obj_idx),
+                    )
+                    if planning is None:
+                        log(
+                            f"[run_seg_icp_grasp] ⚠️ {obj_label} 无可行抓取计划，"
+                            f"跳过该物体，继续检测下一个"
+                        )
+                        continue
+                    if planning.rtde_plan is None or planning.rtde_plan_path is None:
+                        raise RuntimeError(f"{obj_label} 未生成 RTDE 执行计划")
+
+                    log(
+                        f"[run_seg_icp_grasp] {obj_label} 路径规划成功: "
+                        f"frames={len(planning.mot_data.jv_list)}, "
+                        f"grasp=grasp_{planning.selected_grasp_index}, "
+                        f"RTDE={planning.rtde_plan_path}"
+                    )
+
+                # ---- 成功！返回结果 ----
+                log(
+                    f"[run_seg_icp_grasp] *** {obj_label} 全流程成功！*** "
+                    f"RTDE 计划已保存: {planning.rtde_plan_path}"
+                )
+                return {
+                    "rtde_plan_path": planning.rtde_plan_path,
+                    "summary": summary,
+                    "object_index": obj_idx,
+                    "detection": detection,
+                    "planning": planning,
+                    "icp_result": icp_result,
+                    "pick_pose": pick_pose,
+                    "output_dir": det_output_dir,
+                    "rgb_image": image_bgr,
+                    "depth_image": ctx.capture.depth,
+                    "detections": detections,
+                    "mask_image": mask_image,
+                }
+
+            except Exception as exc:
+                log(f"[run_seg_icp_grasp] {obj_label} 失败: {exc}")
+                traceback.print_exc()
+                continue
+            finally:
+                # 恢复每次迭代修改的 ctx 状态
+                ctx.args.mask = original_mask
+                ctx.args.no_yolo = original_no_yolo
+                ctx.output_dir = original_output_dir
+
+        log("[run_seg_icp_grasp] 所有物体均失败，未生成可执行轨迹")
+        return None
+    finally:
+        # 恢复全局 ctx 状态
+        ctx.args.mask = original_mask
+        ctx.args.no_yolo = original_no_yolo
+        ctx.output_dir = original_output_dir
+        ctx.args.bottle_icp = original_bottle_icp
+        ctx.args.completion_matching = original_completion_matching
+        ctx.args.completion_bottle_icp = original_completion_bottle_icp
+        ctx.args.bottle_template = original_bottle_template
+        ctx.args.bottle_template_prompt_gui = original_bottle_template_prompt_gui
+        ctx.args.completion_bottle_template = original_completion_bottle_template
 
 def print_summary(summary: dict) -> None:
     print(f"Kept candidate points (green): {summary['candidate_count']}")
@@ -1950,7 +2492,6 @@ def compute_camera_from_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarr
     cam_pos = center + np.array([cam_dist, -cam_dist, max(cam_dist * 0.65, extent * 0.9)])
     return cam_pos, center, extent
 
-
 def build_bottle_mesh_model(
     bottle_stl: Path,
     transform: np.ndarray,
@@ -1973,7 +2514,6 @@ def build_bottle_mesh_model(
         bottle_model.pos = np.asarray(transform[:3, 3], dtype=np.float64)
         bottle_model.rotmat = np.asarray(transform[:3, :3], dtype=np.float64)
     return bottle_model
-
 
 class InteractiveBottleIcpApp:
     def __init__(self, ctx: PipelineContext):
@@ -2435,10 +2975,299 @@ class InteractiveBottleIcpApp:
     def run(self) -> None:
         self.base.run()
 
-
 def run_batch_once(ctx: PipelineContext) -> dict:
     summary, _masks, _selected_mask = run_segmentation_and_bottle_icp_attempt(ctx)
     return summary
+
+class GraspPlanViewer:
+    """Panda3D viewer that shows the scene, ICP result, and animates the planned grasp trajectory.
+
+    After ``run_seg_icp_grasp`` returns a successful result, this viewer displays:
+    - static scene point clouds (green candidate, gray removed)
+    - box / table / place-box obstacles
+    - ICP registered template points and pick/place poses
+    - trajectory trail markers (orange spheres along the planned path)
+    - a frame-by-frame robot motion animation with held object
+    """
+
+    def __init__(self, ctx: PipelineContext, result: dict, pipeline_module):
+
+        _task_cat = Notify.ptr().getCategory("task")
+        if _task_cat is not None:
+            _task_cat.setSeverity(5)
+
+        self.ctx = ctx
+        self.pipeline_module = pipeline_module
+        self.planning = result["planning"]
+        self.icp_result = result["icp_result"]
+        self.mgm = mgm
+        self.static_models: list[object] = []
+        self.obstacle_models: list[object] = []
+        self.detection_models: list[object] = []
+        self.plan_models: list[object] = []
+        self.animation_data = None
+        self.animation_task_name = "grasp_plan_animation"
+
+        # real_bottle 函数需要的属性，ctx.args 可能没有
+        if not hasattr(ctx.args, "no_env"):
+            ctx.args.no_env = False
+        if not hasattr(ctx.args, "place_pos"):
+            ctx.args.place_pos = None
+        if not hasattr(ctx.args, "place_rpy_deg"):
+            ctx.args.place_rpy_deg = None
+
+        scene_points = ctx.capture.points_world[ctx.candidate_mask | ctx.removed_mask]
+        if len(scene_points) == 0:
+            scene_points = ctx.capture.points_world
+        cam_pos, lookat_pos, extent = compute_camera_from_points(scene_points)
+        self.base = wd.World(cam_pos=cam_pos, lookat_pos=lookat_pos, w=1280, h=720)
+
+        frame_length = max(extent * 0.25, 0.03)
+        frame_radius = max(frame_length * 0.015, 0.0005)
+        mgm.gen_frame(ax_length=frame_length, ax_radius=frame_radius).attach_to(self.base)
+
+        self._attach_static_pointclouds()
+        self._attach_scene_obstacles()
+        self._attach_icp_result()
+        self._attach_plan_result()
+
+        frame_count = len(self.planning.mot_data.jv_list) if hasattr(self.planning.mot_data, "jv_list") else len(self.planning.mot_data)
+        self.status_text = OnscreenText(
+            text=(
+                f"Grasp plan ready: {frame_count} frames, "
+                f"grasp #{self.planning.selected_grasp_index}. "
+                f"RTDE: {self.planning.rtde_plan_path}"
+            ),
+            pos=(-1.28, 0.92),
+            align=TextNode.ALeft,
+            scale=0.044,
+            fg=(0.02, 0.02, 0.02, 1.0),
+            mayChange=True,
+        )
+        print(
+            "[box_object] GraspPlanViewer ready. "
+            "Orange trail = planned TCP path; animated robot shows motion playback. "
+            "Close the window to exit."
+        )
+
+    # ---- static scene ----
+    def _attach_static_pointclouds(self) -> None:
+        args = self.ctx.args
+        candidate_points = self.ctx.capture.points_world[self.ctx.candidate_mask]
+        removed_points = self.ctx.capture.points_world[self.ctx.removed_mask]
+        candidate_points, _ = voxel_downsample_arrays(candidate_points, None, args.candidate_voxel)
+        removed_points, _ = voxel_downsample_arrays(removed_points, None, args.removed_voxel)
+        if len(removed_points) > 0:
+            model = self.mgm.gen_pointcloud(
+                removed_points,
+                rgba=np.array([0.55, 0.55, 0.55, 0.7]),
+                point_size=args.point_size,
+            )
+            model.attach_to(self.base)
+            self.static_models.append(model)
+        if len(candidate_points) > 0:
+            model = self.mgm.gen_pointcloud(
+                candidate_points,
+                rgba=np.array([0.0, 0.85, 0.15, 0.78]),
+                point_size=args.point_size,
+            )
+            model.attach_to(self.base)
+            self.static_models.append(model)
+
+    # ---- scene obstacles (box, table, place box) ----
+    def _attach_scene_obstacles(self) -> None:
+        try:
+            real_pipeline = self.pipeline_module
+
+            box_homomat = self.ctx.box_transform
+            _planning_obstacles, display_obstacles = real_pipeline.build_obstacle_lists(
+                self.ctx.args, box_homomat, include_display=True,
+            )
+            for obstacle in display_obstacles:
+                obstacle.attach_to(self.base)
+                self.obstacle_models.append(obstacle)
+        except Exception as exc:
+            print(f"[box_object] Warning: could not attach scene obstacles: {exc}")
+
+    # ---- ICP result (registered template, pick/place poses) ----
+    def _attach_icp_result(self) -> None:
+        try:
+            real_pipeline = self.pipeline_module
+
+            icp = self.icp_result
+
+            # global registered template points
+            if icp.global_registered_path is not None:
+                registered_pcd = o3d.io.read_point_cloud(str(icp.global_registered_path))
+                registered_points = np.asarray(registered_pcd.points, dtype=np.float64)
+                if len(registered_points) > 0:
+                    model = self.mgm.gen_pointcloud(
+                        registered_points,
+                        rgba=np.array([*GLOBAL_REGISTERED_POINTS_RGB, 0.95]),
+                        point_size=max(self.ctx.args.point_size, 0.0035),
+                    )
+                    model.attach_to(self.base)
+                    self.detection_models.append(model)
+
+            pick_pose = utils.homomat_to_pose(
+                real_pipeline.bottle_homomat_for_icp(icp),
+            )
+            place_pose, _pos_src, _rot_src = real_pipeline.resolve_place_pose(
+                self.ctx.args, pick_pose,
+            )
+
+            # pick / place bottle models
+            start_model = sim_pick.make_object_model(
+                icp.bottle_model_path,
+                pick_pose,
+                name="estimated_pick_start_bottle",
+                alpha=0.55,
+                rgb=np.array([1.0, 0.76, 0.18]),
+            )
+            start_model.attach_to(self.base)
+            start_model.show_cdprim()
+            self.detection_models.append(start_model)
+
+            place_model = sim_pick.make_object_model(
+                icp.bottle_model_path,
+                place_pose,
+                name="planned_place_goal_bottle",
+                alpha=0.32,
+                rgb=np.array([0.2, 0.9, 0.45]),
+            )
+            place_model.attach_to(self.base)
+            place_model.show_cdprim()
+            self.detection_models.append(place_model)
+
+            # coordinate frames and markers
+            for pose, color in (
+                (pick_pose, np.array([1.0, 0.76, 0.18])),
+                (place_pose, np.array([0.2, 0.9, 0.45])),
+            ):
+                frame = self.mgm.gen_frame(
+                    pos=pose[0], rotmat=pose[1], ax_length=0.085, ax_radius=0.002,
+                )
+                frame.attach_to(self.base)
+                self.detection_models.append(frame)
+                marker = self.mgm.gen_sphere(pos=pose[0], radius=0.01, rgb=color, alpha=0.85)
+                marker.attach_to(self.base)
+                self.detection_models.append(marker)
+
+            # arrow from pick to place
+            if np.linalg.norm(place_pose[0] - pick_pose[0]) > 1e-8:
+                arrow = self.mgm.gen_arrow(
+                    spos=pick_pose[0],
+                    epos=place_pose[0],
+                    rgb=np.array([0.2, 0.45, 1.0]),
+                    alpha=0.72,
+                    stick_radius=0.004,
+                )
+                arrow.attach_to(self.base)
+                self.detection_models.append(arrow)
+        except Exception as exc:
+            print(f"[box_object] Warning: could not attach ICP result: {exc}")
+            traceback.print_exc()
+
+    # ---- plan result: trail markers + animation ----
+    def _attach_plan_result(self) -> None:
+
+        mot_data = self.planning.mot_data
+        if len(mot_data) == 0:
+            print("[box_object] No motion frames to visualize.")
+            return
+
+        # draw TCP trail markers
+        marker_robot = sim_pick.make_robot()
+        marker_robot.backup_state()
+        try:
+            for index in range(0, len(mot_data), max(1, sim_pick.RESULT_TRAIL_STRIDE)):
+                jnt_values, ee_values, _obj_pose, _mesh = mot_data[index]
+                marker_robot.goto_given_conf(jnt_values=jnt_values, ee_values=ee_values)
+                marker = self.mgm.gen_sphere(
+                    pos=marker_robot.gl_tcp_pos,
+                    radius=0.006,
+                    rgb=np.array([1.0, 0.35, 0.05]),
+                    alpha=0.75,
+                )
+                marker.attach_to(self.base)
+                self.plan_models.append(marker)
+        finally:
+            marker_robot.restore_state()
+
+        self._start_motion_animation()
+
+    def _start_motion_animation(self) -> None:
+
+        object_model_path = self.planning.object_model_path
+
+        class AnimationData:
+            def __init__(self, motion_data):
+                self.counter = 0
+                self.motion_data = motion_data
+                self.robot = sim_pick.make_robot()
+                self.mesh_model = None
+                self.obj_model = None
+
+        data = AnimationData(self.planning.mot_data)
+        self.animation_data = data
+
+        def update(task):
+            # detach previous frame models
+            for attr in ("mesh_model", "obj_model"):
+                model = getattr(data, attr, None)
+                if model is not None:
+                    for method_name in ("detach", "remove"):
+                        method = getattr(model, method_name, None)
+                        if method is not None:
+                            try:
+                                method()
+                                break
+                            except Exception:
+                                continue
+                    setattr(data, attr, None)
+
+            if data.counter >= len(data.motion_data):
+                data.counter = 0
+
+            jnt_values, ee_values, obj_pose, cached_mesh = data.motion_data[data.counter]
+            if cached_mesh is not None:
+                data.mesh_model = cached_mesh
+            else:
+                data.robot.goto_given_conf(jnt_values=jnt_values, ee_values=ee_values)
+                data.mesh_model = data.robot.gen_meshmodel(
+                    alpha=0.72,
+                    toggle_tcp_frame=True,
+                    toggle_flange_frame=False,
+                    toggle_jnt_frames=False,
+                )
+            if data.mesh_model is not None:
+                data.mesh_model.attach_to(self.base)
+
+            if obj_pose is not None and cached_mesh is None:
+                data.obj_model = sim_pick.make_object_model(
+                    object_model_path,
+                    (
+                        np.asarray(obj_pose[0], dtype=float),
+                        np.asarray(obj_pose[1], dtype=float),
+                    ),
+                    name="animated_held_object",
+                    alpha=0.65,
+                    rgb=np.array([0.95, 0.72, 0.18]),
+                )
+                data.obj_model.attach_to(self.base)
+
+            data.counter += 1
+            return task.again
+
+        self.base.taskMgr.doMethodLater(
+            sim_pick.RESULT_ANIMATION_INTERVAL,
+            update,
+            self.animation_task_name,
+            appendTask=True,
+        )
+
+    def run(self) -> None:
+        self.base.run()
 
 def main() -> None:
     args = parse_args()
@@ -2455,14 +3284,24 @@ def main() -> None:
 
     ctx = prepare_pipeline_context(args)
 
-    if args.show_viewer:
+    if getattr(args, "run_grasp", True):
+        from yanjiuyuan import (
+            real_bottle_pick_place_interactive3_point_completion_with_yolo2_dual as real_pipeline,
+        )
+        result = run_seg_icp_grasp(ctx, pipeline_module=real_pipeline)
+        if result is None:
+            log("[box_object] run_seg_icp_grasp did not produce a plan; nothing to animate.")
+            return
+        viewer = GraspPlanViewer(ctx, result, pipeline_module=real_pipeline)
+        viewer.run()
+    elif args.show_viewer:
         app = InteractiveBottleIcpApp(ctx)
         app.run()
     else:
         run_batch_once(ctx)
 
-
 if __name__ == "__main__":
     main()
+    # 展示点云
     # pointcloud_path = "E:/py_project/wrsrobot/wrs_v2/yanjiuyuan/captures/20260704-170658/box_object_extraction/remaining_pointcloud.ply"
     # show_pointcloud(Path(pointcloud_path))

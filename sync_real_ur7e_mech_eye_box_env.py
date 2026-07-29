@@ -1,4 +1,4 @@
-"""
+﻿"""
 Read the current UR7e state, capture/load the current Mech-Eye point cloud,
 detect the blue box, and show everything together in WRS.
 
@@ -69,6 +69,7 @@ class CameraSceneData:
     colored_ply_path: Optional[Path]
     world_ply_path: Optional[Path]
     output_dir: Optional[Path]
+    depth_path: Optional[Path] = None
     pixel_indices: Optional[np.ndarray] = None
 
 
@@ -78,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--robot-ip", default="192.168.125.30", help="UR controller IP address.")
-    parser.add_argument("--gp-port", default="COM3", help="DH76 gripper serial port passed to UR7EDH76_RTDE.")
+    parser.add_argument("--gp-port", default="COM4", help="DH76 gripper serial port passed to UR7EDH76_RTDE.")
     parser.add_argument("--mock", action="store_true", help="Use a local moving pose instead of connecting to RTDE.")
     parser.add_argument("--period", type=float, default=0.05, help="Robot visualization update period in seconds.")
     parser.add_argument("--once", action="store_true", help="Read one robot pose and keep the WRS window open.")
@@ -178,7 +179,7 @@ def load_or_capture_camera_scene(args: argparse.Namespace, output_dir: Optional[
     if args.ply is None:
         if output_dir is None:
             raise RuntimeError("Internal error: output_dir should exist when capturing from camera.")
-        pcd, rgb_path, colored_ply_path = capture_mech_eye_pointcloud(
+        pcd, rgb_path, colored_ply_path, depth_path = capture_mech_eye_pointcloud(
             output_dir=output_dir,
             ply_out=args.ply_out,
             depth_scale=args.depth_scale,
@@ -212,6 +213,7 @@ def load_or_capture_camera_scene(args: argparse.Namespace, output_dir: Optional[
         colored_ply_path=colored_ply_path,
         world_ply_path=world_ply_path,
         output_dir=output_dir,
+        depth_path=depth_path,
     )
 
 

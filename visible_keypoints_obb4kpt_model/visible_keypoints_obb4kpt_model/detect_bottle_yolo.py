@@ -7,6 +7,7 @@ main() 直接处理图片，不使用命令行参数。
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,11 +16,12 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 import cv2
-
 PACKAGE_ROOT = Path(__file__).resolve().parent  # 当前父目录
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from visible_keypoints_obb4kpt_model.obb_pose import OBBPosePredictor
+from obb_pose import OBBPosePredictor
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 
 def _auto_device() -> str:
@@ -42,13 +44,6 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
 class BottleDetector:
     """瓶子旋转目标检测（OBB）与 4 关键点估计检测器。
-
-    Parameters
-    ----------
-    model_path : str | Path | None
-        模型权重文件路径，默认 ``models/bottle_detect2.pt``。
-    save_dir : str | Path | None
-        渲染结果保存目录，默认 ``images/Mech``。
     """
 
     CLASS_NAMES = {0: "occluded", 1: "clear"}
@@ -64,27 +59,19 @@ class BottleDetector:
     # ------------------------------------------------------------------
     # 初始化
     # ------------------------------------------------------------------
-    def __init__(
-        self,
-        model_path: str | Path | None = None,
-        save_dir: str | Path | None = None,
+    def __init__(self,
+        model_path:str = None,
+        save_dir:str = None,
     ) -> None:
-        self.weights = Path(
-            model_path or (PACKAGE_ROOT / "models" / "bottle_detect2.pt")
-        ).resolve()
+        self.weights = Path( PACKAGE_ROOT / "model" / "bottle_detect2.pt").resolve() if model_path is None else model_path
         if not self.weights.is_file():
             raise FileNotFoundError(self.weights)
-
         self.device = _auto_device()
         self.conf = 0.528
         self.iou = 0.70
-        self.imgsz = 960  # 检测的图像尺寸
+        self.imgsz = 960    # 检测的图像尺寸
         self.visibility = 0.50
-        self.save_dir = Path(
-            save_dir or (PACKAGE_ROOT / "images" / "Mech")
-        ).resolve()
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-
+        self.save_dir = Path( PACKAGE_ROOT / "outputs").resolve() if save_dir is None else save_dir
         self._predictor = OBBPosePredictor(
             overrides={
                 "model": str(self.weights),
@@ -104,7 +91,6 @@ class BottleDetector:
     def detect(
         self,
         image: Image.Image | np.ndarray,
-        image_name: str | None = None,
         show: bool = False,
         save: bool = False,
     ) -> list[dict]:
@@ -113,11 +99,7 @@ class BottleDetector:
         Parameters
         ----------
         image : PIL.Image.Image | np.ndarray
-            输入图片，可以是 PIL Image 或 numpy 数组（H, W, 3）。
-            注意：cv2.imread 返回的是 BGR 数组，会自动转为 RGB。
-        image_name : str | None
-            图片名称（不含扩展名），用于 save 时生成文件名。
-            为 None 时自动使用时间戳。
+            输入图片，可以是 PIL Image 或 numpy 数组（H, W, 3），RGB 或 BGR 均可。
         show : bool
             为 True 时弹出系统默认图片查看器显示渲染结果。
         save : bool
@@ -126,7 +108,9 @@ class BottleDetector:
         Returns
         -------
         list[dict]
-            检测结果列表，按 class_id 降序 + OBB 面积降序排列。
+            检测结果列表，按置信度降序排列。每个元素包含::
+                class_id, class_name, confidence, xywhr_px,
+                corners_px, keypoints_px
         """
         pil_image = self._to_pil(image)
         source = np.array(pil_image)  # predictor 接收 numpy 数组
@@ -138,7 +122,7 @@ class BottleDetector:
         if show or save:
             rendered = self.render(pil_image, detections)
             if save:
-                save_path = self._resolve_save_path(image_name)
+                save_path = self._resolve_save_path(self.save_dir)
                 rendered.save(str(save_path), format="PNG", compress_level=6)
                 print(f"渲染结果已保存至: {save_path}")
             if show:
@@ -149,10 +133,9 @@ class BottleDetector:
     # ------------------------------------------------------------------
     # 可视化渲染
     # ------------------------------------------------------------------
-    def render(
-        self,
-        image: Image.Image,
-        detections: list[dict],
+    def render(self,
+               image: Image.Image,
+               detections: list[dict],
     ) -> Image.Image:
         """在图片上绘制 OBB 框、关键点和标签。"""
         canvas = image.copy()
@@ -211,21 +194,18 @@ class BottleDetector:
         if isinstance(image, Image.Image):
             return image.convert("RGB")
         if isinstance(image, np.ndarray):
-            # cv2.imread 返回 BGR，需转为 RGB
-            if image.ndim == 3 and image.shape[2] == 3:
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             return Image.fromarray(image.astype(np.uint8), mode="RGB")
         raise TypeError(f"Unsupported image type: {type(image)}")
 
-    def _resolve_save_path(self, image_name: str | None = None) -> Path:
-        """在 save_dir 下生成渲染图的保存路径。"""
-        if image_name:
-            filename = f"{image_name}_det.png"
-        else:
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"det_{timestamp}.png"
-        return self.save_dir / filename
+    @staticmethod
+    def _resolve_save_path(image_path: str | Path | None) -> Path:
+        """根据 image_path 推导渲染图的保存路径。"""
+        if image_path is not None:
+            src = Path(image_path)
+            return src.parent / f"{src.stem}_det.png"
+        save_dir = PACKAGE_ROOT / "outputs" / "visualizations"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        return save_dir / "det_result.png"
 
     def _parse_result(self, result: Any) -> list[dict]:
         # 计算检测结果
@@ -249,12 +229,12 @@ class BottleDetector:
                         "class_name": self.CLASS_NAMES[class_id],
                         "confidence": confidence,
                         "xywhr_px": [float(v) for v in row[:5]],
-                        "obb_area": obb_area,  # obb矩形框面积
-                        "corners_px": [[float(v) for v in p] for p in polygon],  # obb矩形框
-                        "keypoints_px": [[float(v) for v in p] for p in points],  # 关键点
+                        "obb_area": obb_area,   # obb矩形框面积
+                        "corners_px": [[float(v) for v in p] for p in polygon], # obb矩形框
+                        "keypoints_px": [[float(v) for v in p] for p in points],    # 关键点
                     }
                 )
-        # 排序：先按 class_id 降序（不遮挡 clear=1 在前，遮挡 occluded=0 在后），
+        # 排序：先按 class_id 降序（不遮挡clear=1 在前，遮挡occluded=0 在后），
         # 组内按 OBB 面积降序（面积大的在前）
         detections.sort(
             key=lambda item: (item["class_id"], item["obb_area"]),
@@ -283,23 +263,14 @@ class BottleDetector:
 
 
 if __name__ == "__main__":
-    detector = BottleDetector(
-        model_path=PACKAGE_ROOT / "models" / "bottle_detect2.pt",
-        save_dir=PACKAGE_ROOT / "images" / "Mech",
-    )
-    image_path = r"E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\captures\20260729-134721\rgb.png"
+
+    output_dir = Path(PACKAGE_ROOT / "outputs").resolve()
+    vis_dir = output_dir / "visualizations"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    detector = BottleDetector()
+    image_path = r"E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\images\Mech\color_image_20260623-173827.jpg"
     img = cv2.imread(image_path)
 
-    detections = detector.detect(
-        img,
-        image_name="color_image_20260623-173827",
-        show=True,
-        save=True,
-    )
-    print(f"检测到 {len(detections)} 个目标:")
-    for i, det in enumerate(detections, 1):
-        print(
-            f"  [{i}] {det['class_name']:<10} "
-            f"conf={det['confidence']:.3f}  "
-            f"area={det['obb_area']:.0f}"
-        )
+    detections = detector.detect(img, show=True, save=True)
+    print(f"detections: {detections}")

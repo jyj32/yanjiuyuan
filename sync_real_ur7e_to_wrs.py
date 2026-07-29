@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         description="Draw a WRS UR7e DH76 robot and synchronize it with the real UR7e via RTDE."
     )
     parser.add_argument("--robot-ip", default="192.168.125.30", help="UR controller IP address.")
-    parser.add_argument("--gp-port", default="COM3", help="DH76 gripper serial port passed to UR7EDH76_RTDE.")
+    parser.add_argument("--gp-port", default="COM4", help="DH76 gripper serial port passed to UR7EDH76_RTDE.")
     parser.add_argument("--period", type=float, default=0.05, help="Visualization update period in seconds.")
     parser.add_argument("--mock", action="store_true", help="Use a local moving pose instead of connecting to RTDE.")
     parser.add_argument("--no-env", action="store_true", help="Do not draw the reference table/camera/box models.")
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 class RealUR7ERTDEState:
 
     def __init__(self, robot_ip: str, gp_port: str):
-        from robot_con.ur.ur7e_dh76_rtde import UR7EDH76_RTDE
+        from wrs.robot_con.ur.ur7e_dh76_rtde import UR7EDH76_RTDE
 
         self._robot_x = UR7EDH76_RTDE(robot_ip=robot_ip, gp_port=gp_port)
         self._closed = False

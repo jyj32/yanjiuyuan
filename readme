@@ -1,6 +1,7 @@
-设置接近路径距离：E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sim_pick_and_place.py
-设置箱子的不透明度,碰撞体：E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\box_collision.py
-
-点云补全采集的点数：network_input_points: int = 2048    在E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sam_completion_template_matching.py中
-global registration的粗配准循环数： ransac_attempts: int = 3    在E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sam_completion_template_matching.py中
-指定pickle文件：E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sim_pick_and_place.py里的GRASP_PICKLE_PATH
+1.设置接近路径距离：APPROACH_DISTANCE 在E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sim_pick_and_place.py
+2.设置箱子的不透明度,碰撞体：E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\box_collision.py
+3.拍数据集 E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\mech_eye_ur7e_pointcloud_env.py
+4.点云补全采集的点数：network_input_points: int = 2048    在E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sam_completion_template_matching.py中
+5.global registration的粗配准循环数： ransac_attempts: int = 3    在E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sam_completion_template_matching.py中
+6.指定pickle文件：E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\sim_pick_and_place.py里的GRASP_PICKLE_PATH
+7.路径规划:build_pick_place_rtde_plan()在E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\pick_place_rtde_utils.py

@@ -1,0 +1,19 @@
+{
+  "deployment_status": "verified",
+  "deployed_at": "2026-07-29T12:04:00+08:00",
+  "model_description": "Version A trained from 444 human-reviewed images",
+  "source_model": "/Users/joe/Downloads/相机3d/版本A444张训练_结果与报告_2026-07-29/训练结果/version_A_444_human_final_yolo11s_obb_4kpt/weights/best.pt",
+  "source_sha256": "08a250571e2213afc6ae9544f1d2884281d588e5eed0003d30694bcb87de8259",
+  "production_entry": "E:\\wrs\\yanjiuyuan\\yolo_detect2.py",
+  "production_model": "E:\\wrs\\yanjiuyuan\\models\\bottle_detect2.pt",
+  "package_model": "E:\\wrs\\yanjiuyuan\\visible_keypoints_obb4kpt_model\\model\\best.pt",
+  "backup_directory": "E:\\wrs\\backup_before_versionA444_model_20260729_1204",
+  "offline_smoke_test": {
+    "status": "PASS",
+    "image": "C:\\Users\\ThinkStation\\Desktop\\versionA444_final_link\\images\\test\\rgb_136.png",
+    "detection_count": 3,
+    "class_ids": [1, 1, 1],
+    "keypoint_counts": [4, 4, 4],
+    "device": "0"
+  }
+}

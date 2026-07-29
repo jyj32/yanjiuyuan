@@ -1,4 +1,4 @@
-"""Generate a UR7e + DH76 bottle pick-and-place path with WRS PickPlacePlanner."""
+﻿"""Generate a UR7e + DH76 bottle pick-and-place path with WRS PickPlacePlanner."""
 
 from __future__ import annotations
 
@@ -20,13 +20,13 @@ for root in (REPO_ROOT, WRS_ROOT):
 
 import wrs.basis.robot_math as rm  # noqa: E402
 
-from yanjiuyuan.constants import MODEL_DIR  # noqa: E402
+from yanjiuyuan.constants import MODEL_DIR, PICK_APPROACH_DEPART_DISTANCE  # noqa: E402
 from yanjiuyuan.sync_real_ur7e_to_wrs import DEFAULT_HOME_CONF  # noqa: E402
 
 
 CUSTOM_BOTTLE_MODEL_PATH = Path(__file__).resolve().parent / "meshes" / "bottle.STL"
 OBJECT_MODEL_PATH = CUSTOM_BOTTLE_MODEL_PATH if CUSTOM_BOTTLE_MODEL_PATH.exists() else MODEL_DIR / "bottle.stl"
-GRASP_PICKLE_PATH = Path(__file__).resolve().parent / "grasps" / "bottle_dh76_3.pickle" # 抓取pickle文件
+GRASP_PICKLE_PATH = Path(__file__).resolve().parent / "grasps" / "bottle_dh76_4.pickle" # 抓取pickle文件
 
 PICK_POS = np.array([0.6, 0.0, 0.08], dtype=float)
 PICK_RPY_DEG = np.array([0.0, 90, 0], dtype=float)
@@ -35,11 +35,9 @@ PLACE_RPY_DEG = np.array([0.0, 90, 0], dtype=float)
 
 IK_SOLVER = 'ikfast'
 OPEN_JAW_WIDTH = 0.118
-APPROACH_DISTANCE = 0.13    # 抓取路径距离0.18
+APPROACH_DISTANCE = 0.1    # 抓取路径距离0.1
 # PICK_APPROACH_DISTANCE = 0.13
-PICK_APPROACH_DEPART_DISTANCE = 0.27
-# PLACE_APPROACH_DISTANCE = 0.13
-# PLACE_APPROACH_DEPART_DISTANCE = 0.13
+
 
 LINEAR_GRANULARITY = 0.015
 USE_RRT = True

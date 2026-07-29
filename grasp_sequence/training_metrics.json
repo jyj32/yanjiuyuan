@@ -1,0 +1,25 @@
+{
+  "status": "complete",
+  "version": "第一版本_完整优先级排序",
+  "mode": "full_ranking",
+  "best_epoch": 17,
+  "validation_metrics_at_best": {
+    "top1_accuracy": 0.8387096774193549,
+    "pairwise_accuracy": 0.8318181818181818,
+    "mean_reciprocal_rank": 0.8962365591397848,
+    "scene_count": 31.0,
+    "embedding_std_mean": null,
+    "pairwise_cosine_mean": null,
+    "prototype_raw_norm": null
+  },
+  "test_metrics": {
+    "top1_accuracy": 0.7333333333333333,
+    "pairwise_accuracy": 0.8034934497816594,
+    "mean_reciprocal_rank": 0.8355555555555555,
+    "scene_count": 30.0
+  },
+  "annotation_combined_sha256": "88a8ead1a5e76603a96a42c6ac342123dc00b3030778de31c6a42867fadbcaf0",
+  "human_annotations_only": true,
+  "first_network_loaded": false,
+  "completed_at_unix": 1784964782.8985705
+}

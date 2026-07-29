@@ -1,0 +1,21 @@
+{
+  "bundle_name": "优先级网络_第一版本_完整优先级排序",
+  "mode": "full_ranking",
+  "checkpoint_epoch": 17,
+  "checkpoint_sha256": "da6ed8c4049b0f558d67eca44fda003c1401f0c9a304ced2df3607e0ea506064",
+  "yolo11s_sha256": "85a76fe86dd8afe384648546b56a7a78580c7cb7b404fc595f97969322d502d5",
+  "state_tensor_count": 662,
+  "parameter_count": 30442699,
+  "image_size": 960,
+  "depth_near_mm": 900.0,
+  "depth_far_mm": 1400.0,
+  "score_type": "priority_head_raw_score",
+  "test_metrics": {
+    "top1_accuracy": 0.7333333333333333,
+    "pairwise_accuracy": 0.8034934497816594,
+    "mrr": 0.8355555555555556,
+    "scene_count": 30
+  },
+  "training_authority": "human_final_annotations_only",
+  "first_network_loaded_during_training": false
+}

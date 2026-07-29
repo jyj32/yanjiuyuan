@@ -1,4 +1,4 @@
-"""
+﻿"""
 Show Mech-Eye point cloud data in a UR7e-without-table WRS environment.
 
 Default usage:
@@ -154,17 +154,19 @@ def make_output_dir(output_root: Path, output_dir: Optional[Path]) -> Path:
 
 def capture_mech_eye_pointcloud(output_dir: Path, ply_out: Optional[Path], depth_scale: float, depth_trunc: float):
     import cv2
+    import numpy as np
     import open3d as o3d
     from wrs.drivers.devices.Mech_eye.Mech_camera import CaptureImage
 
     output_dir.mkdir(parents=True, exist_ok=True)
     rgb_path = output_dir / "rgb.png"
+    depth_path = output_dir / "depth.npy"
     colored_ply_path = ply_out if ply_out is not None else output_dir / "colored_pointcloud.ply"
     colored_ply_path.parent.mkdir(parents=True, exist_ok=True)
 
     camera = CaptureImage(save_directory=str(output_dir))
     try:
-        rgb, _, pcd = camera.capture_and_generate_pointcloud(
+        rgb, depth, pcd = camera.capture_and_generate_pointcloud(
             save=False,
             show=False,
             pcb_out_path=str(colored_ply_path),
@@ -175,10 +177,17 @@ def capture_mech_eye_pointcloud(output_dir: Path, ply_out: Optional[Path], depth
         if rgb is None or pcd is None:
             raise RuntimeError("Mech-Eye capture did not return RGB data and point cloud data.")
         cv2.imwrite(str(rgb_path), rgb)
+        # 保存对齐深度图（Mech-Eye 原始深度，单位 mm，与 RGB 同分辨率对齐），供顺序推理模型使用
+        saved_depth_path = None
+        if depth is not None:
+            depth_arr = np.asarray(depth, dtype=np.float32)
+            np.save(str(depth_path), depth_arr)
+            print(f"Saved depth map (mm) to: {depth_path}")
+            saved_depth_path = depth_path
         if not pcd.has_colors():
             print("Warning: captured point cloud has no color data.")
         o3d.io.write_point_cloud(str(colored_ply_path), pcd, write_ascii=False)
-        return pcd, rgb_path, colored_ply_path
+        return pcd, rgb_path, colored_ply_path, saved_depth_path
     finally:
         try:
             camera.camera.disconnect()

@@ -12,7 +12,7 @@ def show_pickle(base, pickle_path, obj_path=None, gripper=None, obj_rgba=None):
 
     参数:
         base: wd.World 实例（仿真场景）
-        pickle_path: str, pickle 文件路径（如 'bottle_dh76.pickle'）
+        pickle_path: str, pickle 文件路径
         obj_path: str, 可选，物体 STL 文件路径。若提供则加载并显示
         gripper: 夹爪实例，若为 None 则自动创建一个 Dh76 实例
         obj_rgba: list/np.array, 物体颜色和透明度，默认 [1,1,0,0.5]（黄色半透明）
@@ -94,18 +94,18 @@ def merge_multiple_pickle(pickle_path_list, output_path=None):
           f"总计 {len(merged)} 个位姿，保存至 {save_path}")
 
 if __name__ == "__main__":
-    # base = wd.World(cam_pos=[1, 1, 1], lookat_pos=[0, 0, 0])
-    # mgm.gen_frame().attach_to(base)
-    # gripper = dh.Dh76(fingertip_type = "r_76")
-    # # 展示pickle文件的抓取姿态
-    # show_pickle(base,
-    #             pickle_path="result/bottle_dh76_neck_1_2.pickle",
-    #             obj_path="../models/bottle.stl",
-    #             gripper=gripper,
-    #             obj_rgba=[1, 1, 0, 1]
-    #             )
-    #
-    # base.run()
+    base = wd.World(cam_pos=[1, 1, 1], lookat_pos=[0, 0, 0])
+    mgm.gen_frame().attach_to(base)
+    gripper = dh.Dh76(fingertip_type = "r_76")
+    # 展示pickle文件的抓取姿态
+    show_pickle(base,
+                pickle_path="../grasps/bottle_dh76_push.pickle",
+                obj_path="../models/bottle.stl",
+                gripper=gripper,
+                obj_rgba=[1, 1, 0, 1]
+                )
+
+    base.run()
 
     # # 合并两个pickle文件，把后者放到前者的后面
     # merge_pickle('bottle_dh76_push.pickle', 'bottle_dh76_neck_1_2.pickle', 'result/bottle_dh76_push.pickle')
@@ -120,13 +120,13 @@ if __name__ == "__main__":
     #     ],
     #     output_path='result/bottle_dh76_neck.pickle'
     # )
-    merge_multiple_pickle(
-        pickle_path_list=[
-            'result/bottle_dh76_front_back.pickle',
-            'result/bottle_dh76_head.pickle',
-            'result/bottle_dh76_bottom.pickle',
-            'result/bottle_dh76_neck.pickle',
-            'result/bottle_dh76_handle.pickle',
-        ],
-        output_path='bottle_dh76_4.pickle'
-    )
+    # merge_multiple_pickle(
+    #     pickle_path_list=[
+    #         'result/bottle_dh76_bottom.pickle', # 放在front_back上面
+    #         'result/bottle_dh76_front_back.pickle',
+    #         'result/bottle_dh76_head.pickle',
+    #         'result/bottle_dh76_neck.pickle',
+    #         'result/bottle_dh76_handle.pickle',
+    #     ],
+    #     output_path='bottle_dh76_4.pickle'
+    # )

@@ -1,0 +1,6 @@
+# Install a PyTorch build matching the deployment machine's CUDA version first.
+# Training host reference: torch 2.12.0.dev20260314+cu130.
+torch>=2.5
+ultralytics==8.3.39
+opencv-python>=4.9,<5
+numpy>=1.26,<3

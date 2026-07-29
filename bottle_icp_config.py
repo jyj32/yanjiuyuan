@@ -1,4 +1,4 @@
-"""Central bottle ICP parameters shared by offline and real pipelines."""
+﻿"""Central bottle ICP parameters shared by offline and real pipelines."""
 
 from __future__ import annotations
 

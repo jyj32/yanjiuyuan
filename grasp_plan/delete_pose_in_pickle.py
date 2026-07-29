@@ -40,19 +40,36 @@ class ViewerControl:
 
         # ---------- 创建 tkinter 控制界面 ----------
         self.root.title("抓取姿态查看器")
-        self.root.geometry("300x150")
+        self.root.geometry("380x150")
 
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
 
-        btn_continue = tk.Button(btn_frame, text="继续 (Next)", command=self.on_continue, width=12)
+        btn_prev = tk.Button(btn_frame, text="上一个 (←/P)", command=self.on_previous, width=12)
+        btn_prev.pack(side=tk.LEFT, padx=5)
+
+        btn_continue = tk.Button(btn_frame, text="继续 (→/N)", command=self.on_continue, width=12)
         btn_continue.pack(side=tk.LEFT, padx=5)
 
-        btn_delete = tk.Button(btn_frame, text="删除 (Delete)", command=self.on_delete, width=12)
+        btn_delete = tk.Button(btn_frame, text="删除 (Del/X)", command=self.on_delete, width=12)
         btn_delete.pack(side=tk.LEFT, padx=5)
 
         self.status_label = tk.Label(self.root, text=self._status_text(), font=("Arial", 12))
         self.status_label.pack(pady=10)
+
+        # ---------- 键盘快捷键 ----------
+        # 上一个：Left / p / P
+        self.root.bind("<Left>", lambda e: self.on_previous())
+        self.root.bind("<Key-p>", lambda e: self.on_previous())
+        self.root.bind("<Key-P>", lambda e: self.on_previous())
+        # 继续：Right / n / N
+        self.root.bind("<Right>", lambda e: self.on_continue())
+        self.root.bind("<Key-n>", lambda e: self.on_continue())
+        self.root.bind("<Key-N>", lambda e: self.on_continue())
+        # 删除：Delete / x / X
+        self.root.bind("<Delete>", lambda e: self.on_delete())
+        self.root.bind("<Key-x>", lambda e: self.on_delete())
+        self.root.bind("<Key-X>", lambda e: self.on_delete())
 
         # 关闭窗口时关闭仿真
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -106,6 +123,14 @@ class ViewerControl:
         else:
             messagebox.showinfo("提示", "已是最后一个姿态")
 
+    def on_previous(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._show_current_grasp()
+            self.status_label.config(text=self._status_text())
+        else:
+            messagebox.showinfo("提示", "已是第一个姿态")
+
     def on_delete(self):
         if not self.grasp_list:
             messagebox.showwarning("提示", "没有姿态可删除")
@@ -146,7 +171,7 @@ if __name__ == '__main__':
     viewer = ViewerControl(
         root=root,
         base=base,
-        pickle_path="result/bottle_dh76_neck_2_2.pickle",   # 修改为您的 pickle 路径
+        pickle_path="./result/bottle_dh76_push.pickle",   # 修改为您的 pickle 路径
         obj_path="../models/bottle.stl",    # 物体模型路径（可选）
         obj_rgba=[1, 1, 0, 0.6]             # 黄色半透明
     )
