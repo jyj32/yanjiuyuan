@@ -5,12 +5,13 @@ from typing import Optional, Tuple
 import numpy as np
 
 # 参数配置文件
+# cd E:\wrs
+# C:\Users\ThinkStation\.conda\envs\wrs\python.exe -u E:\wrs\yanjiuyuan\real_bottle_pick_place_interactive3_point_completion_with_yolo2_dual.py
 YANJIUYUAN_DIR = Path(__file__).resolve().parent
 MODEL_DIR = YANJIUYUAN_DIR / "models"
 BOX_MODEL_PATH = MODEL_DIR / "box.STL"
 BOX_TEMPLATE_PLY = MODEL_DIR / "box_z_parallel_surface_points.ply"
 BOX_CAPTURE_ROOT = YANJIUYUAN_DIR / "captures"
-
 
 # 相机外参矩阵
 CAMERA_TO_WORLD = np.array(
@@ -23,14 +24,12 @@ CAMERA_TO_WORLD = np.array(
     dtype=float,
 )
 
-# Default world-frame bottle place goal used by the offline ICP -> pick-and-place scripts.
-# Tune this when you want to put the placed bottle closer to/farther from the robot.
-BOTTLE_ROBOT_SIDE_PLACE_POS = (0.2, -0.5, 0.15) # 放置位置（世界坐标系下）
-BOTTLE_ROBOT_SIDE_PLACE_POSE_pos = (0.46, -0.073, 0.35) # moveL的放置位置
+# 放置第三段 moveL 下落到放置点时的【固定基系 6D 位姿】
+BOTTLE_ROBOT_SIDE_PLACE_POSE = (0.5248904130890554, -0.09060575663570135, 0.5089901486924078, 0.21223605337485246, 3.114375583320056, -0.034457954571697876)
 
 # 抓取/放置规划距离参数（集中管理，供 sim_pick_and_place / real_pipeline_planning / dual 等调用）
-PICK_APPROACH_DEPART_DISTANCE = 0.35  # 抓起后竖直抬离距离 (m)：抓取点 TCP 沿世界 +Z 抬离
-PICK_LIFT_MAX_Z = 0.65  # 抓起后抬升航点的最大 Z 高度 (m)
+PICK_APPROACH_DEPART_DISTANCE = 0.5  # 抓起后竖直抬离距离 (m)：抓取点 TCP 沿世界 +Z 抬离
+PICK_LIFT_MAX_Z = 0.60  # 抓起后抬升航点的最大 Z 高度 (m)
 
 Range3D = Optional[Tuple[Optional[float], Optional[float]]]
 
@@ -178,6 +177,8 @@ REAL_PIPELINE_CONFIG = {
     "completion_selected_outlier_nb_neighbors": 24,
     "completion_selected_outlier_std_ratio": 1.8,
     "completion_selected_outlier_min_keep_ratio": 0.65,
+    # Real-time path stays in memory; enable only when diagnosing point clouds.
+    "save_perception_debug_outputs": False,
     "completion_bottle_icp": True,
     "completion_bottle_template": "surface",
     "completion_bottle_template_ply": None,
@@ -186,41 +187,26 @@ REAL_PIPELINE_CONFIG = {
 
     # Robot, camera, and execution.
     "robot_ip": "192.168.125.30",
-    "gp_port": "COM3",
+    "gp_port": "COM4",
     "mock": False,
     "depth_scale": 0.001,
     "depth_trunc": 3.0,
     "scene_max_points": 150000,
     "scene_point_size": 0.002,
+    "save_capture_rgb": False,
     "save_capture_pointclouds": False,
     "rtde_plan_out": None,
     "execute_dry_run": False,
     "max_start_joint_error_deg": 5.0,
     "use_move_l_compliant": True,  # 是否使用力控
+    # 运动速度
+    "fast_v": 1.0,
+    "fast_a": 1.0,
+    "slow_v": 0.5,
+    "slow_a": 0.5,
 
-    # Compliant pick approach. Tune these here, not from the command line.
-    "compliant_force": 40.0,    # 力控的力
-    "compliant_vel": 0.06,    # 力控的速度
-    "compliant_lateral_tolerance": 0.01,
-    "compliant_lateral_stop_tolerance": "auto",
-    "compliant_force_frame": "direction",
-    "compliant_axes": None,
-    "compliant_zero_ft_sensor": True,   # 力控前清零 FT 传感器基线，使接触力检测准确
-    "compliant_max_tcp_force": 20.0,    # 接触反力阈值，达到后将退出力控
-    "compliant_timeout": 15.0,    # 比默认(max(2.0,3*d/vel))更宽松的安全兜底，避免慢速接近误杀
-    "compliant_dwell_after_stop": 1.0,    # 力控接触/到位软停后继续保压的时长(s)
-
-    # Compliant place press（放置力控下压坐实/压实）。Tune these here, not from the command line.
-    "place_press_enabled": True,
-    "place_press_distance": 0.20,
-    "place_press_force": 40.0,
-    "place_press_vel": 0.08,
-    "place_press_lateral_tolerance": 0.01,
-    "place_press_lateral_stop_tolerance": "auto",
-    "place_press_zero_ft_sensor": True,
-    "place_press_max_tcp_force": 20.0,
-    "place_press_timeout": 15.0,
-    "place_press_dwell_after_stop": 0,    # 放置力控下压软停后继续保压的时长(s)
+    # 手爪参数
+    "open_jaw_width":0.118, # 打开宽度
 
     # Planning.
     "skip_plan": False,
@@ -232,21 +218,29 @@ REAL_PIPELINE_CONFIG = {
     "open_jaw": None,
     "approach_distance": None,
     "action_sequence": 1,
-    "grasp_pickle": sim_pick.GRASP_PICKLE_PATH, # 抓取pickle文件
+    "grasp_pickle": YANJIUYUAN_DIR / "grasps" / "bottle_dh76_4.pickle", # 抓取pickle文件
     "push_pickle": YANJIUYUAN_DIR / "grasps" / "bottle_dh76_push.pickle", # 推开pickle文件
+
+    # 抓取力控
+    "grasp_distance": 0.1 ,    # 距离
+    "compliant_force": 40.0,    # 力
+    "compliant_vel": 0.1,    # 速度
+    "compliant_lateral_tolerance": 0.01,
+    "compliant_lateral_stop_tolerance": "auto",
+    "compliant_force_frame": "direction",
+    "compliant_axes": None,
+    "compliant_zero_ft_sensor": True,   # 力控前清零 FT 传感器基线，使接触力检测准确
+    "compliant_max_tcp_force": 20.0,    # 接触反力阈值，达到后将退出力控
+    "compliant_timeout": 15.0,    # 比默认(max(2.0,3*d/vel))更宽松的安全兜底，避免慢速接近误杀
+    "compliant_dwell_after_stop": 1.0,    # 力控接触/到位软停后继续保压的时长(s)
 
     # Push（推开）阶段配置：所有物体都没有抓取时，按检测顺序重新检测每个物体，
     # 查 push_pickle 中对应检测序号的推开位姿，有则运行时路径规划（RRT 接近 + 力控接触 + 闭合 + 张开 + moveL 离开）并推开。
     "push_enabled": True,            # 是否启用“无抓取→推开”阶段（默认关闭，避免改变既有抓取流水线行为）
-    "push_depart_distance": 0.35,     # 推开后竖直离开距离 (m)，复用 compliant 的“接触/保压”设置
-    "push_leave_vel": 0.1,            # 离开 moveL 速度 (m/s)
-    "push_leave_acc": 0.3,            # 离开 moveL 加速度 (m/s^2)
-    "max_outer_cycles": 20,          # 抓取/推开外层循环最大轮数（安全上限，正常会因“本轮无抓取且无可推开”提前结束）
-
-    # Push（推开）阶段力控接触参数：独立于“抓取 Compliant pick approach”的力控设置，
+    "push_depart_distance": 0.4,     # 推开后竖直离开距离 (m)，复用 compliant 的“接触/保压”设置
     # 统一在此调参。不再从命令行 args.compliant_* 读取（那批键本未定义，运行期会 AttributeError）。
-    "push_compliant_force": 30.0,                 # 推开力控的力
-    "push_compliant_vel": 0.08,                   # 推开力控的速度
+    "push_compliant_force": 40.0,                 # 推开力控的力
+    "push_compliant_vel": 0.1,                   # 推开力控的速度
     "push_compliant_lateral_tolerance": 0.02,     # 侧向容差
     "push_compliant_lateral_stop_tolerance": "auto",
     "push_compliant_force_frame": "direction",    # 力控方向帧
@@ -260,19 +254,37 @@ REAL_PIPELINE_CONFIG = {
     # 【水平】方向力控推一段（把瓶子从箱壁/角落拖回箱子中央），然后张开手爪、竖直上抬离开。
     # 力控方向经 robot.get_real_tcp_pose_sim 换算到真实机器人基系（moveL_compliant 按真实基系解释 direction）。
     "push_center_enabled": True,                  # 是否启用“往箱子中心推”力控段
-    "push_center_distance": 0.10,                 # 往箱子中心推的距离 (m)
+    "push_center_distance": 0.05,                 # 往箱子中心推的距离 (m)
     "push_center_force": 40.0,                    # 力控推力 (N)
-    "push_center_vel": 0.06,                      # 力控速度 (m/s)
+    "push_center_vel": 0.1,                      # 力控速度 (m/s)
     "push_center_lateral_tolerance": 0.02,        # 侧向容差
     "push_center_lateral_stop_tolerance": "auto",
     "push_center_zero_ft_sensor": True,           # 力控前清零 FT 传感器基线
-    "push_center_max_tcp_force": 30.0,            # 接触反力阈值，达到后软停（视为正常结束）
-    "push_center_timeout": 10.0,                  # 力控安全超时 (s)
+    "push_center_max_tcp_force": 45.0,            # 接触反力阈值，达到后软停（视为正常结束）
+    "push_center_timeout": 3.0,                  # 力控安全超时 (s)
     "push_center_dwell_after_stop": 2.0,          # 软停后继续保压时长 (s)
-
     # push 候选坐标系：True=物体局部系（与抓取候选一致，需按检测物体 3D 位姿变换成基系 TCP 后逐个尝试）；
     # False=直接把 pickle 中的位姿当机器人基系固定 TCP 用（旧行为）。ac_pos 量级 ±0.1m 已证实为局部系，默认 True。
     "push_candidates_object_local": True,
+
+    # ---- 放置前抓取确认（TCP 外力检测）----
+    "place_grip_force_check_enabled": True,    # 是否启用放置前抓取确认（关闭则一律照常放置）
+    "place_grip_force_threshold": 10.0,        # TCP 外力幅值阈值 (N)，≥ 视为已抓到物体（按均值标定），抓住时在19N以上，未抓住时在3N以下
+    "place_grip_force_window_s": 1.0,          # 外力采样窗口 (s)，固定时长；后台采样与回退现场采样共用
+    "place_grip_force_rate_hz": 20.0,          # 外力采样频率 (Hz)
+
+    # Compliant place press（放置力控下压坐实/压实）。Tune these here, not from the command line.
+    "place_press_enabled": True,
+    "place_press_distance": 0.15,
+    "place_press_force": 40.0,
+    "place_press_vel": 0.1,
+    "place_press_lateral_tolerance": 0.01,
+    "place_press_lateral_stop_tolerance": "auto",
+    "place_press_zero_ft_sensor": True,
+    "place_press_max_tcp_force": 20.0,
+    "place_press_timeout": 15.0,
+    "place_press_dwell_after_stop": 0,    # 放置力控下压软停后继续保压的时长(s)
+
 
     "dry_run": False,
     "use_rrt": True,
@@ -291,6 +303,7 @@ REAL_PIPELINE_CONFIG = {
 
     # 抓取起点关节角，单位：弧度，6个值。
     "grasp_start_conf_rad": [1.2610626220703125, -1.5542540115169068, 1.4155376593219202, -1.680861612359518, -1.4960697332965296, 1.3155012130737305],
+
 }
 
 

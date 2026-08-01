@@ -65,10 +65,17 @@ def parse_args() -> argparse.Namespace:
 
 class RealUR7ERTDEState:
 
-    def __init__(self, robot_ip: str, gp_port: str):
+    def __init__(self, robot_ip: str = None, gp_port: str = None, robot_x=None):
         from wrs.robot_con.ur.ur7e_dh76_rtde import UR7EDH76_RTDE
 
-        self._robot_x = UR7EDH76_RTDE(robot_ip=robot_ip, gp_port=gp_port)
+        # robot_x 由调用方传入已存在的实例（通常是进程级单例 UR7EDH76_RTDE）。
+        # 此时本对象只是“借用”，close() 不得断开共享连接，否则会切断主线程/其它调用方的会话。
+        if robot_x is not None:
+            self._robot_x = robot_x
+            self._borrowed = True
+        else:
+            self._robot_x = UR7EDH76_RTDE(robot_ip=robot_ip, gp_port=gp_port)
+            self._borrowed = False
         self._closed = False
 
     def get_jnt_values(self) -> np.ndarray:
@@ -94,6 +101,9 @@ class RealUR7ERTDEState:
         if self._closed:
             return
         self._closed = True
+        # 借用共享单例时，不在此断开（交由进程级 disconnect_rtde_robot() 统一回收）。
+        if self._borrowed:
+            return
         try:
             self._robot_x.disconnect()
         except Exception as exc:

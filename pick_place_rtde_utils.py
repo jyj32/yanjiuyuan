@@ -13,6 +13,7 @@ import numpy as np
 from wrs.basis import robot_math as rm
 
 
+
 @dataclass
 class RtdeMotionSegment:
     name: str
@@ -77,8 +78,9 @@ MOVE_L_COMPLIANT_KWARGS = {
 
 # Default speeds for native moveL transfer segments (m/s, m/s^2). Pick-and-place
 # is conservative; tune via segment.vel / segment.acc or the planner caller.
-MOVE_L_DEFAULT_VEL = 0.25
-MOVE_L_DEFAULT_ACC = 0.5
+from constants import REAL_PIPELINE_CONFIG
+MOVE_L_DEFAULT_VEL = REAL_PIPELINE_CONFIG["fast_v"]
+MOVE_L_DEFAULT_ACC = REAL_PIPELINE_CONFIG["fast_a"]
 
 
 def _move_l_compliant_kwargs(
@@ -260,11 +262,22 @@ def _emit_transfer_segments(
     open_index: int,
     transfer_movel_waypoints_world: Optional[list] = None,
     place_pos_base: Optional[list] = None,
+    fixed_place_pose_base: Optional[list] = None,
     depart_distance: Optional[float] = None,
+    move_l_vel: float = MOVE_L_DEFAULT_VEL,
+    move_l_acc: float = MOVE_L_DEFAULT_ACC,
+    j1_swing_vel: float = 0.3,
+    j1_swing_acc: float = 0.6,
 ) -> None:
-    """Emit the transfer as up to three native ``moveL`` segments (lift / horizontal /
-    lower). The transfer keeps TCP orientation constant, so every moveL target reuses
-    the base-frame rotation vector captured at the grasp point.
+    """Emit the transfer as three segments: (1) native ``moveL`` lift straight up,
+    (2) **rotate only joint 1** to swing the arm to above/near the place point (no
+    Cartesian moveL — avoids the bad IK / straight-line collision of the old horizontal
+    traverse), (3) native ``moveL`` lower straight down to the place point.
+    The transfer keeps TCP orientation constant *within* each moveL. The lift
+    segment (1) reuses the grasp-point base-frame rotation vector; the lower
+    segment (3) reuses the **second-segment-end** rotation vector (the grasp
+    orientation rotated about the base Z by the joint-1 swing), so the object
+    is lowered with the same orientation it had after the swing (no mid-air twist).
 
     When ``transfer_movel_waypoints_world`` (a 3-tuple of world-frame TCP positions for
     the lift-top / above-place / place targets) is provided, those exact targets are
@@ -281,6 +294,7 @@ def _emit_transfer_segments(
     base_pos, base_rotmat = _robot_base_pose_world(robot)
     rotvec = _tcp_pose_base_6d(robot, jv_list[post_pick_start], base_pos, base_rotmat)[3:].tolist()
 
+    waypoint_global_idx = None
     if transfer_movel_waypoints_world is not None and len(transfer_movel_waypoints_world) == 3:
         waypoint_base_pos = []
         for w in transfer_movel_waypoints_world:
@@ -306,30 +320,116 @@ def _emit_transfer_segments(
             np.asarray(tcp_positions_base[widx], dtype=float).reshape(3).tolist() for widx in waypoint_global_idx
         ]
 
+    # 抬升顶点（lift-top）关节构型：第二段“只旋转关节1”必须从这个高度开始摆动，
+    # 绝不能误用 jv_list[post_pick_start]（抓取高度，尚未抬起）——否则旋转时 TCP 会先下落到
+    # 抓取高度、贴近桌面触发 protective_stop。抬升顶点 = waypoint_base_pos[0]（竖直 +Z 抬离后的航点）。
+    if waypoint_global_idx is not None:
+        _lift_conf = np.asarray(jv_list[waypoint_global_idx[0]], dtype=float).reshape(-1)
+    else:
+        # 显式航点分支：用抓取构型作 seed 对抬升顶点航点做 IK 得到其关节角（该航点已在 gen_pick_only_path 校验可达）。
+        _lift_base = np.asarray(waypoint_base_pos[0], dtype=float).reshape(3)
+        _lift_seed = np.asarray(jv_list[post_pick_start], dtype=float).reshape(-1)
+        _lift_rotmat = np.asarray(robot.fk(jnt_values=_lift_seed)[1], dtype=float).reshape(3, 3)
+        _lift_world = base_pos + base_rotmat @ _lift_base
+        _lift_conf = robot.ik(tgt_pos=_lift_world, tgt_rotmat=_lift_rotmat, seed_jnt_values=_lift_seed)
+        if _lift_conf is None:
+            _lift_conf = _lift_seed  # 极少触发：航点已在 gen_pick_only_path 校验过可达
+        _lift_conf = np.asarray(_lift_conf, dtype=float).reshape(-1)
+
+    # 固定放置位姿：提供时第三段 moveL 终点直接用 BOTTLE_ROBOT_SIDE_PLACE_POSE（基系 6D），
+    # 不再计算（不经 get_real_tcp_pose_from_conf 旋转抓取姿态）。第二段 swing 仍按该位姿方位角对齐。
+    _fixed_pose = None
+    if fixed_place_pose_base is not None:
+        _fixed_pose = np.asarray(fixed_place_pose_base, dtype=float).reshape(6)
+        if place_pos_base is None:
+            place_pos_base = _fixed_pose[:3].tolist()
+
     _anchor = place_pos_base is not None and depart_distance is not None
+    # 第二段（仅旋转关节1）结束后，TCP 方位角随关节1转过 Δaz；第三段（下落放置）
+    # 必须沿用【第二段终点】的真实法兰盘姿态，而非抓取点姿态，否则下落 moveL 会从旋转后
+    # 的姿态强行转回抓取姿态、导致物体横摆/碰撞。下面用 get_real_tcp_pose_from_conf
+    # 推算“抬升顶点构型(lift_conf) + 关节1偏移 Δaz”对应的真实基系姿态，作为第三段与放置点姿态。
+    swing_end_rotvec = list(rotvec)
+    if _fixed_pose is not None:
+        # 固定放置位姿：第三段 moveL 终点姿态直接用 BOTTLE_ROBOT_SIDE_PLACE_POSE 的姿态部分，
+        # 不再经 get_real_tcp_pose_from_conf 旋转抓取姿态计算（用户要求第三段终点固定为常量位姿）。
+        swing_end_rotvec = _fixed_pose[3:].tolist()
     if _anchor and len(waypoint_base_pos) == 3:
         # 让仿真回退 pose（dry-run / 实机读取失败）也对齐显式基坐标系放置点：
         # wp2 水平段用放置点 XY（保持抬起高度），wp3 直接落到放置点。
         _pb = np.asarray(place_pos_base, dtype=float).reshape(3)
         waypoint_base_pos[1] = [float(_pb[0]), float(_pb[1]), float(waypoint_base_pos[1][2])]
         waypoint_base_pos[2] = _pb.tolist()
+        if _fixed_pose is None:
+            # —— 计算第二段终点（关节1旋转后）的真实法兰盘姿态 ——
+            try:
+                # 关键：当前方位角与放置点方位角必须【都用真实基系】推算——通过
+                # get_real_tcp_pose_from_conf 把 swing_start_conf(lift_conf) 映射成真实法兰盘位姿后
+                # 取 atan2(y,x)，与执行端 move_jnt1_swing 分支的算法【逐字一致】。
+                # 否则一旦仿真基系与真实基系存在 180° 偏航，规划期用 _tcp_pose_base_6d（仿真基系）
+                # 算出的 Δaz 会与执行期反算的 Δaz 相差 180°，导致写入的 swing_end_rotvec 与机器人
+                # 实际摆动终点姿态不一致，第三段下落时姿态错乱（放置姿态不对）。
+                _cur = np.asarray(robot.get_real_tcp_pose_from_conf(_lift_conf), dtype=float).reshape(6)
+                _cur_az = math.atan2(float(_cur[1]), float(_cur[0]))  # 真实基系方位角
+                _place_az = math.atan2(float(_pb[1]), float(_pb[0]))   # place_pos_base 即真实基系
+                _daz = math.atan2(
+                    math.sin(_place_az - _cur_az), math.cos(_place_az - _cur_az)
+                )  # 最短弧，约束 [-pi, pi]；与执行端 move_jnt1_swing 同公式（真实基系）
+                _swing_conf = np.asarray(_lift_conf, dtype=float).reshape(-1).copy()
+                _swing_conf[0] += float(_daz)
+                _swing_end = robot.get_real_tcp_pose_from_conf(_swing_conf)
+                swing_end_rotvec = np.asarray(_swing_end, dtype=float).reshape(6)[3:].tolist()
+                print(
+                    f"[rtde_plan] 第二段终点(关节1旋转 {math.degrees(float(_daz)):.1f}°) 真实法兰盘姿态 rotvec="
+                    f"{np.round(swing_end_rotvec, 4).tolist()}"
+                )
+            except Exception as _exc:
+                print(f"[rtde_plan] ⚠️ 计算第二段终点姿态失败，回退抓取姿态: {_exc}")
+                swing_end_rotvec = list(rotvec)
+        # else: 固定放置位姿时 swing_end_rotvec 已 = _fixed_pose[3:]，第二段 swing 仅按 place_pos_base
+        # 方位角对齐，不再计算旋转后姿态（第三段 moveL 直接落到该固定位姿）。
     for k, pos in enumerate(waypoint_base_pos):
         _meta = {"path_type": "pick_place_movel", "transfer_subsegment": k + 1}
+        _cmd = "moveL"
+        _pose = list(pos) + (swing_end_rotvec if k == 2 else rotvec)
+        _vel = float(move_l_vel)
+        _acc = float(move_l_acc)
         if _anchor:
             _meta["anchor_to_actual_tcp"] = True
             _meta["transfer_role"] = k + 1
             _meta["place_pos_base"] = list(place_pos_base)
             _meta["depart_distance"] = float(depart_distance)
             _meta["grasp_rotvec_fallback"] = list(rotvec)
+            if k == 2:
+                # 第三段（lower to place）姿态 = 第二段终点真实法兰盘姿态（关节1旋转后），
+                # 供执行端“搬运段重算”覆盖 _wp3 时使用（与规划期 _pose 一致）。
+                _meta["swing_end_rotvec"] = list(swing_end_rotvec)
+        if k == 1:
+            # 第二段：不用笛卡尔 moveL 水平直线（易碰撞/无解），改为【只旋转第1关节】，
+            # 让机械臂绕基座 Z 轴摆到放置点上方附近（方位角对齐放置点），
+            # 再由第三段 moveL 竖直下落到放置点（含少量半径修正）。
+            # 执行端在运行时依据实际 TCP 方位角与 place_pos_base 反算目标关节1角；此处不带笛卡尔位姿。
+            _cmd = "move_jnt1_swing"
+            _meta["anchor_to_actual_tcp"] = False  # 不进入“搬运段重算”（无笛卡尔位姿）
+            _meta["place_pos_base"] = list(place_pos_base)
+            _meta["depart_distance"] = float(depart_distance)
+            _meta["grasp_rotvec_fallback"] = list(rotvec)
+            _meta["swing_end_rotvec"] = list(swing_end_rotvec)  # 记录第二段终点姿态（供参考）
+            # 摆动起始关节构型：第一段 moveL 抬升结束后的【抬升顶点】关节角（= _lift_conf），
+            # 绝非抓取高度构型——否则旋转时 TCP 会先下落撞桌。执行端据此在仿真模型中推算当前 TCP 方位角。
+            _meta["swing_start_conf"] = list(_lift_conf)
+            _meta["j1_swing_vel"] = float(j1_swing_vel)
+            _meta["j1_swing_acc"] = float(j1_swing_acc)
+            _pose = list(pos) + swing_end_rotvec   # 仅占位（dry-run/可视化用），执行端忽略
         segments.append(
             RtdeMotionSegment(
                 name=f"transfer_to_place_movel_{k + 1}",
-                command="moveL",
+                command=_cmd,
                 start_index=post_pick_start,
                 end_index=open_index,
-                pose=list(pos) + rotvec,
-                vel=MOVE_L_DEFAULT_VEL,
-                acc=MOVE_L_DEFAULT_ACC,
+                pose=_pose,
+                vel=_vel,
+                acc=_acc,
                 metadata=_meta,
             )
         )
@@ -392,13 +492,18 @@ def build_pick_place_rtde_plan(
     compliant_dwell_after_stop: float = 2.0,
     transfer_movel_waypoints_world: Optional[list] = None,
     transfer_movel_place_pos_base: Optional[list] = None,
+    fixed_place_pose_base: Optional[list] = None,
+    transfer_movel_vel: float = MOVE_L_DEFAULT_VEL,
+    transfer_movel_acc: float = MOVE_L_DEFAULT_ACC,
+    j1_swing_vel: float = 0.3,
+    j1_swing_acc: float = 0.6,
     # 放置后力控竖直下压（将物体坐实/压实）。默认开启：机器人竖直下落到放置点后、
     # 松开手爪前，沿实际 TCP 工具 +Z（竖直向下）以合规力控下压一段距离并保压，
     # 到位或触力即停，然后才松开手爪。
     place_press_enabled: bool = True,
     place_press_distance: float = 0.10,
     place_press_force: float = 40.0,
-    place_press_vel: float = 0.08,
+    place_press_vel: float = 0.1,
     place_press_lateral_tolerance: float = 0.01,
     place_press_lateral_stop_tolerance: float | str | None = "auto",
     place_press_zero_ft_sensor: bool = True,
@@ -417,7 +522,7 @@ def build_pick_place_rtde_plan(
     push_center_pos_world: Optional[list] = None,
     push_center_distance: float = 0.10,            # 往箱子中心推的距离 (m)
     push_center_force: float = 30.0,               # 力控推力 (N)
-    push_center_vel: float = 0.06,                 # 力控速度 (m/s)
+    push_center_vel: float = 0.1,                 # 力控速度 (m/s)
     push_center_lateral_tolerance: float = 0.02,
     push_center_lateral_stop_tolerance: float | str | None = "auto",
     push_center_zero_ft_sensor: bool = True,
@@ -680,7 +785,12 @@ def build_pick_place_rtde_plan(
                 open_index,
                 transfer_movel_waypoints_world=transfer_movel_waypoints_world,
                 place_pos_base=_place_pos_base,
+                fixed_place_pose_base=fixed_place_pose_base,
                 depart_distance=_depart_distance,
+                move_l_vel=transfer_movel_vel,
+                move_l_acc=transfer_movel_acc,
+                j1_swing_vel=j1_swing_vel,
+                j1_swing_acc=j1_swing_acc,
             )
             # 6.放置时力控竖直下压（将物体坐实/压实）—— 在下落到放置点之后、松开手爪之前
             if place_press_enabled and place_press_distance > 1e-6:
@@ -846,6 +956,7 @@ def execute_rtde_execution_plan(
     rtde_robot,
     plan: RtdeExecutionPlan,
     dry_run: bool = True,
+    robot: Any = None,
     prepend_actual_joint: bool = False,
     jntspace_kwargs: Optional[dict[str, Any]] = None,
     jntspace_kwargs_by_segment: Optional[dict[str, dict[str, Any]]] = None,
@@ -886,7 +997,6 @@ def execute_rtde_execution_plan(
                     path_kwargs = _jntspace_kwargs_for_segment(segment, jntspace_kwargs, jntspace_kwargs_by_segment)
                     entry["jntspace_kwargs"] = dict(path_kwargs)
                     rtde_robot.move_jntspace_path(path, **path_kwargs)
-                    rtde_robot.move_jnts(path[-1], 0.5, 0.5)    # 避免到不了目标点
                     _assert_not_stopped(rtde_robot, segment, log)
             elif segment.command == "moveL_compliant":  # 力控，现在还是位控
                 entry["direction"] = segment.direction
@@ -955,6 +1065,53 @@ def execute_rtde_execution_plan(
                     acc = float(segment.acc if segment.acc is not None else MOVE_L_DEFAULT_ACC)
                     rtde_robot.moveL(target_pose, vel, acc, wait=True)
                     _assert_not_stopped(rtde_robot, segment, log)
+            elif segment.command == "move_jnt1_swing":
+                # 仅旋转第1关节：以“实际 TCP 位姿”为基准，将机械臂绕基座 Z 轴摆到
+                # 放置点方位角（atan2(y, x)，基坐标系）处，使 TCP 位于放置点正上方附近；
+                # 第3段 moveL 再竖直下落到放置点（含少量半径修正）。
+                # 此段依赖真实机器人反馈，dry-run 仅记录、不运动。
+                entry["note"] = "rotate only joint 1 to align base-frame azimuth with place"
+                if not dry_run:
+                    _assert_not_stopped(rtde_robot, segment, log)
+                    _place_b = np.asarray(
+                        segment.metadata.get("place_pos_base"), dtype=float
+                    ).reshape(3)
+                    # 当前关节构型：必须以【机器人实际当前关节角】为基准，保证 move_jnts 只动关节1。
+                    # 不再用 swing_start_conf 直接做 move_jnts 目标——抬升段被实际位姿重算后，
+                    # 实际关节角 ≠ 规划 swing_start_conf，move_jnts 会把关节2-6 拽回规划值
+                    # （其他轴旋转 / protective_stop；物体2 复现）。
+                    # 方位角仍由“实际当前关节角”经仿真模型推算（与 swing_end_rotvec 同帧），与
+                    # place_pos_base 同帧算 Δaz，确保仅关节1 转动且终点方位角对齐放置点。
+                    _cur_jnt = np.asarray(rtde_robot.get_jnt_values(), dtype=float).reshape(-1)
+                    if robot is not None and hasattr(robot, "get_real_tcp_pose_from_conf"):
+                        _tcp = np.asarray(
+                            robot.get_real_tcp_pose_from_conf(_cur_jnt), dtype=float
+                        ).reshape(6)
+                    else:
+                        _tcp = np.asarray(rtde_robot.getActualTCPPose(), dtype=float).reshape(6)
+                    # 仿真 TCP 与放置点均在机器人基坐标系下，方位角 atan2(y, x) 直接可比。
+                    _cur_az = math.atan2(_tcp[1], _tcp[0])
+                    _tgt_az = math.atan2(_place_b[1], _place_b[0])
+                    _daz = math.atan2(
+                        math.sin(_tgt_az - _cur_az), math.cos(_tgt_az - _cur_az)
+                    )  # 最短弧，约束在 [-pi, pi]
+                    _tgt_j1 = _cur_jnt[0] + _daz
+                    # UR 关节1 限位 ±360° = ±2π；越界夹紧（极端情形会轻微偏航，属异常）。
+                    _j1_lim = 2.0 * math.pi
+                    if _tgt_j1 > _j1_lim or _tgt_j1 < -_j1_lim:
+                        print(
+                            f"[rtde] ⚠️ 关节1目标 {math.degrees(_tgt_j1):.1f}° 越界，夹紧到 ±360°"
+                        )
+                        _tgt_j1 = max(min(_tgt_j1, _j1_lim), -_j1_lim)
+                    _target = _cur_jnt.copy()
+                    _target[0] = _tgt_j1
+                    _j1_vel = float(segment.metadata.get("j1_swing_vel", 0.3))
+                    _j1_acc = float(segment.metadata.get("j1_swing_acc", 0.6))
+                    entry["cur_j1_deg"] = math.degrees(_cur_jnt[0])
+                    entry["tgt_j1_deg"] = math.degrees(_tgt_j1)
+                    entry["delta_az_deg"] = math.degrees(_daz)
+                    rtde_robot.move_jnts(_target, _j1_vel, _j1_acc, wait=True)
+                    _assert_not_stopped(rtde_robot, segment, log)
             elif segment.command == "close_gripper_to":
                 if segment.jaw_width is None:
                     raise ValueError(f"Segment {segment.name} requires jaw_width")
@@ -985,7 +1142,4 @@ def execute_rtde_execution_plan(
             ) from exc
         log.append(entry)
     return log
-
-
-
 

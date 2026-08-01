@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import time
+import math
 from typing import Any, Optional
 import numpy as np
 import open3d as o3d
@@ -17,8 +18,7 @@ for root in (REPO_ROOT, WRS_ROOT):
         sys.path.insert(0, root_str)
 
 from yanjiuyuan.constants import (  # noqa: E402
-    BOTTLE_ROBOT_SIDE_PLACE_POS,
-    BOTTLE_ROBOT_SIDE_PLACE_POSE_pos,
+    BOTTLE_ROBOT_SIDE_PLACE_POSE,
     PICK_APPROACH_DEPART_DISTANCE,
     PICK_LIFT_MAX_Z,
     REAL_PIPELINE_CONFIG,
@@ -33,27 +33,45 @@ from types1 import ObjectIcpResult, PlanningResult, RtdeObjectPose
 import utils
 
 # 真实机器人抓取路径规划
+_LAST_SUCCESSFUL_GRASP_INDEX: Optional[int] = None
 
-# 放置位置箱碰撞体
-def make_robot_side_place_box_collision_obstacle(show_cdprim: bool = False):
-    place_pos = np.asarray(BOTTLE_ROBOT_SIDE_PLACE_POS, dtype=float).reshape(3)
+
+def prioritize_candidate_indices(candidate_indices, last_successful_index: Optional[int]) -> list[int]:
+    ordered = [int(index) for index in candidate_indices]
+    if last_successful_index is None or int(last_successful_index) not in ordered:
+        return ordered
+    preferred = int(last_successful_index)
+    return [preferred] + [index for index in ordered if index != preferred]
+
+
+def candidate_planning_attempts(candidate_indices, use_rrt: bool) -> list[tuple[int, bool]]:
+    ordered = [int(index) for index in candidate_indices]
+    direct_attempts = [(index, False) for index in ordered]
+    if not use_rrt:
+        return direct_attempts
+    return direct_attempts + [(index, True) for index in ordered]
+
+
+# 没卡曼德相机碰撞体
+def make_camera_collision_obstacle(show_cdprim: bool = False):
+    camera_pos = np.array([0.7, 0.0, 1.2], dtype=float)    # 相机碰撞体在世界坐标系的位置 (m)
     box_sgm = mgm.gen_box(
-        xyz_lengths=np.array([0.20, 0.2, 0.1], dtype=float),    # 箱体尺寸
+        xyz_lengths=np.array([0.30, 0.3, 0.1], dtype=float),    # 箱体尺寸（相机占位包围盒）
         rgb=np.array([1.0, 0.62, 0.2], dtype=float),    # 颜色
         alpha=0.28, # 不透明度
     )
-    place_box = mcm.CollisionModel(
+    camera_box = mcm.CollisionModel(
         box_sgm,
-        name="robot_side_place_box_collision",
+        name="camera_collision",
         cdprim_type=mcm.const.CDPrimType.AABB,
         ex_radius=0.005,
         rgb=np.array([1.0, 0.62, 0.2], dtype=float), # 颜色
         alpha=0.28, # 不透明度
     )
-    place_box._name = "robot_side_place_box_collision"
-    place_box.pose = (place_pos, np.eye(3))
-    place_box.show_cdprim()
-    return place_box
+    camera_box._name = "camera_collision"
+    camera_box.pose = (camera_pos, np.eye(3))
+    camera_box.show_cdprim()
+    return camera_box
 
 # 障碍列表
 def build_obstacle_lists(
@@ -75,12 +93,11 @@ def build_obstacle_lists(
         display_obstacles.extend(detected_box_panels)
     if args.box_obstacle:
         planning_obstacles.extend(detected_box_panels)
-    # 放置位置箱体
-    robot_side_place_box = make_robot_side_place_box_collision_obstacle(show_cdprim=include_display)
-    # robot_side_place_box.attach_to(base)
-    planning_obstacles.append(robot_side_place_box)
+    # 相机碰撞体（世界系 (0.7, 0, 1.2) m 处，搬运/接近过程中避免机械臂打到相机）
+    camera_box = make_camera_collision_obstacle(show_cdprim=include_display)
+    planning_obstacles.append(camera_box)
     if include_display:
-        display_obstacles.append(robot_side_place_box)
+        display_obstacles.append(camera_box)
     return planning_obstacles, display_obstacles
 
 #  碰撞预检
@@ -280,9 +297,9 @@ def make_first_joint_alignment_path(
 ) -> tuple[list[np.ndarray], float]:
     start_conf = np.asarray(start_conf, dtype=float).reshape(-1)
     base_pos = robot_arm_base_pos(robot)
-    target_xy = (np.asarray(BOTTLE_ROBOT_SIDE_PLACE_POS, dtype=float).reshape(3) - base_pos)[:2]
+    target_xy = (np.asarray(BOTTLE_ROBOT_SIDE_PLACE_POSE, dtype=float)[:3] - base_pos)[:2]
     if np.linalg.norm(target_xy) < 1e-9:
-        raise RuntimeError("robot-base-to-BOTTLE_ROBOT_SIDE_PLACE_POS xy vector is too small for post-pick alignment.")
+        raise RuntimeError("robot-base-to-BOTTLE_ROBOT_SIDE_PLACE_POSE xy vector is too small for post-pick alignment.")
     lower, upper = first_joint_range(robot)
     sample_step = max(float(np.radians(sample_step_deg)), 1e-4)
     sample_count = int(np.ceil((upper - lower) / sample_step)) + 1
@@ -308,7 +325,7 @@ def make_first_joint_alignment_path(
     if not candidates:
         raise RuntimeError(
             f"No counterclockwise first-joint angle makes TCP-base XY direction within {max_angle_deg:.1f} deg "
-            f"of robot-base-to-BOTTLE_ROBOT_SIDE_PLACE_POS xy={target_xy.tolist()}."
+            f"of robot-base-to-BOTTLE_ROBOT_SIDE_PLACE_POSE xy={target_xy.tolist()}."
         )
 
     candidates.sort(key=lambda item: (item[0], item[1]))
@@ -336,6 +353,7 @@ def gen_pick_only_path(robot, object_model_path: Path, grasps, pick_pose, place_
         做周围点云筛选 → 筛选手爪姿态 → 调 PickPlacePlanner.gen_pick_approach_only
         生成"接近段"→ 接 下沉/第1轴对齐/抬升 等后处理，返回 (selected_grasp_index, mot_data)
     """
+    global _LAST_SUCCESSFUL_GRASP_INDEX
     _t_total_start = time.time()
     _t_reason: float = 0.0
     _t_pcd_filter: float = 0.0
@@ -354,6 +372,10 @@ def gen_pick_only_path(robot, object_model_path: Path, grasps, pick_pose, place_
     sim_pick.debug_print("  directions: pick approach=grasp TCP +Z, pick depart=+Z")
 
     planner = ppp.PickPlacePlanner(robot)   # 规划器
+    # Real RTDE execution consumes joint/end-effector values only. Avoid spending
+    # ~0.1 s per frame generating Panda3D robot meshes for a non-visual path.
+    planner.im_planner.toggle_mesh = False
+    planner.rrtc_planner.toggle_mesh = False
 
     grasp_collection = sim_pick.make_grasp_collection(robot, grasps)
     # ---- 获取 remaining point cloud 周围点云 ----
@@ -399,10 +421,23 @@ def gen_pick_only_path(robot, object_model_path: Path, grasps, pick_pose, place_
             return None, None
     else:
         candidate_indices = list(range(len(grasps)))
+    candidate_indices = prioritize_candidate_indices(
+        candidate_indices,
+        _LAST_SUCCESSFUL_GRASP_INDEX,
+    )
+    if candidate_indices and candidate_indices[0] == _LAST_SUCCESSFUL_GRASP_INDEX:
+        sim_pick.debug_print(
+            f"  优先重试上一轮成功抓姿: pickle_grasp_{_LAST_SUCCESSFUL_GRASP_INDEX}"
+        )
 
     pick_approach_jaw_width_source = f"default +0.015m grasp jaw"
 
-    for grasp_index in candidate_indices:
+    planning_attempts = candidate_planning_attempts(candidate_indices, sim_pick.USE_RRT)
+    rrt_phase_announced = False
+    for grasp_index, attempt_use_rrt in planning_attempts:
+        if attempt_use_rrt and not rrt_phase_announced:
+            rrt_phase_announced = True
+            sim_pick.debug_print("  所有候选直达路径均失败，开始原 RRT 回退阶段")
         grasp = grasps[grasp_index]
         grasp_width = grasp_jaw_width(grasp)
         pick_approach_jaw_width = pick_approach_jaw_width_for_grasp(robot, grasp)
@@ -427,7 +462,7 @@ def gen_pick_only_path(robot, object_model_path: Path, grasps, pick_pose, place_
             pick_approach_distance=pick_approach_distance,
             linear_granularity=sim_pick.LINEAR_GRANULARITY,
             obstacle_list=obstacle_list,
-            use_rrt=sim_pick.USE_RRT,   # 使用rrt避障
+            use_rrt=attempt_use_rrt,
             toggle_dbg=False,
         )
         _t_path_plan += time.time() - _t0
@@ -440,7 +475,7 @@ def gen_pick_only_path(robot, object_model_path: Path, grasps, pick_pose, place_
         _t0 = time.time()
         # ---- 抓取点闭合夹爪（拿起物体）----
         closed_width = sim_pick.clamp_jaw_width(robot, grasp_width)
-        grasp_conf = np.asarray(mot_data.jv_list[-1], dtype=float).copy()
+        grasp_conf = np.asarray(mot_data.jv_list[-1], dtype=float).copy()   # 抓取点
         mot_data.extend(
             [grasp_conf],
             ev_list=[closed_width],
@@ -448,32 +483,56 @@ def gen_pick_only_path(robot, object_model_path: Path, grasps, pick_pose, place_
         )
         sim_pick.debug_print(f"  Closed gripper at grasp point: jaw={closed_width:.5f} m")
 
-        # ---- 三段搬运以原生 moveL 执行（规划侧不再生成关节直线轨迹）----
+        # ---- 三段搬运以原生 moveL 执行（仿真中计算）----
         # 段1: 竖直 +Z 抬起离开；段2: 水平移动到放置点正上方；段3: 竖直下落到放置点。
-        # 规划侧只校验航点 IK 可达性并记录放置点关节角；RTDE 拆分器用
-        # transfer_movel_waypoints_world 生成原生 moveL 段（rtde_robot.moveL）执行。
-        start_tcp_pos, _start_tcp_rotmat = robot.fk(jnt_values=grasp_conf)
+        # 规划侧只校验航点 IK 可达性并记录放置点关节角
+        start_tcp_pos, _start_tcp_rotmat = robot.fk(jnt_values=grasp_conf)  # 获取抓取点位置和旋转矩阵
         start_tcp_pos = np.asarray(start_tcp_pos, dtype=float).reshape(3)
-        depart_distance = float(PICK_APPROACH_DEPART_DISTANCE)
-        lifted_pos = start_tcp_pos + sim_pick.rm.const.z_ax * depart_distance
+        depart_distance = float(PICK_APPROACH_DEPART_DISTANCE)  # 抓起后上移距离
+        lifted_pos = start_tcp_pos + sim_pick.rm.const.z_ax * depart_distance   # 抓取点上方点位置
         lifted_pos[2] = min(lifted_pos[2], PICK_LIFT_MAX_Z) # 限制高度，以免过高到不了
-        place_pos = np.asarray(place_pose[0], dtype=float).reshape(3)
-        above_place_pos = np.array([place_pos[0], place_pos[1], min(lifted_pos[2],0.63)], dtype=float)
+        place_pos = np.asarray(place_pose[0], dtype=float).reshape(3)   # 放置位置
+        above_place_pos = np.array([place_pos[0], place_pos[1], lifted_pos[2]], dtype=float)    # 放置点上方位置
         waypoints = [lifted_pos, above_place_pos, place_pos]
         seg_labels = ["lift +Z (depart)", "move above place (XY)", "lower to place"]
-        cur_conf = grasp_conf
-        seg_total = 0.0
-        move_ok = True
-        # ---- 不规划关节直线轨迹：仅校验三个航点（保持抓取点姿态）的 IK 可达性，
-        #      并记录放置点关节角供拆分器定位 open 事件；笛卡尔直线由 RTDE 原生 moveL 执行。----
+        move_ok = True  # 三段movel的终点ik是否有解
+        # ---- 不规划关节直线轨迹，仅校验三个航点（保持抓取点姿态）的 IK 可达性，
         _chk_start_pos, _chk_start_rotmat = robot.fk(jnt_values=grasp_conf)
         _chk_start_rotmat = np.asarray(_chk_start_rotmat, dtype=float).reshape(3, 3)
         _seed = np.asarray(grasp_conf, dtype=float).reshape(-1)
         place_conf = None
-        for wp, label in zip(waypoints, seg_labels):
+
+        # 第二段改为只旋转第1关节：第三段（下落放置）的真实姿态 = 抓取姿态绕基座 Z 轴旋转 Δaz，
+        # 其中 Δaz = wrap(放置点方位角 − 抓取点方位角)（均在机器人基坐标系下）。
+        _base_pos, _base_rotmat = rtde_utils._robot_base_pose_world(robot)
+        _grasp_base = rtde_utils._tcp_pose_base_6d(robot, grasp_conf, _base_pos, _base_rotmat)
+        _grasp_az = math.atan2(float(_grasp_base[1]), float(_grasp_base[0]))
+        _place_base_xy = _base_rotmat.T @ (np.asarray(place_pos, dtype=float).reshape(3) - _base_pos)
+        _place_az = math.atan2(float(_place_base_xy[1]), float(_place_base_xy[0]))
+        _daz = math.atan2(
+            math.sin(_place_az - _grasp_az), math.cos(_place_az - _grasp_az)
+        )  # 最短弧，约束 [-pi, pi]；关节1绕基座Z旋转 ⇒ Δ方位角 == Δ关节1
+        # 世界系旋转矩阵：绕“基座 Z 轴在世界系中的方向”旋转 Δaz（基座 Z 即机器人竖直轴）
+        _base_z_world = _base_rotmat @ np.array([0.0, 0.0, 1.0])
+        _rot_about_z = sim_pick.rm.rotmat_from_axangle(_base_z_world, float(_daz))
+        _chk_third_rotmat = (_rot_about_z @ _chk_start_rotmat).astype(float)    # 放置点旋转矩阵
+        sim_pick.debug_print(
+            f"  pickle_grasp_{grasp_index}: 第三段 IK 校验姿态 = 抓取姿态绕基座Z旋转 {math.degrees(float(_daz)):.1f}°"
+        )
+
+        for wp, label in zip(waypoints, seg_labels):    # 三段路径点计算
+            # 第二段“移到放置点正上方”已改为只旋转第1关节，
+            # 其关节角由执行端按实际 TCP 方位角实时反算，规划侧无法预知，故跳过笛卡尔 IK 校验。
+            if label == "move above place (XY)":    # 移到放置点上方
+                sim_pick.debug_print(
+                    f"  pickle_grasp_{grasp_index}: 第二段为关节1旋转，跳过笛卡尔 IK 校验"
+                )
+                continue
+            # 第三段（下落放置）使用旋转后的姿态；第一段（抬升）保持抓取点姿态。
+            _tgt_rot = _chk_third_rotmat if label == "lower to place" else _chk_start_rotmat
             _jnt = robot.ik(
                 tgt_pos=np.asarray(wp, dtype=float).reshape(3),
-                tgt_rotmat=_chk_start_rotmat,
+                tgt_rotmat=_tgt_rot,
                 seed_jnt_values=_seed,
             )
             if _jnt is None:
@@ -546,6 +605,7 @@ def gen_pick_only_path(robot, object_model_path: Path, grasps, pick_pose, place_
             f"post_pick={_t_post_pick:.3f}s, "
             f"total={_t_total:.3f}s"
         )
+        _LAST_SUCCESSFUL_GRASP_INDEX = int(grasp_index)
         return grasp_index, mot_data
 
     sim_pick.debug_print(
@@ -714,7 +774,7 @@ def plan_push(
         raise FileNotFoundError(f"Object model not found: {object_model_path}")
 
     # 障碍列表：与抓取规划（run_or_skip_plan）完全一致 —— 复用 build_obstacle_lists：
-    #   桌子(table) + 箱子壁(detected_box_panels, 受 args.box_obstacle 控制, 配置默认 True) + 放置箱体(robot_side_place_box)。
+    #   桌子(table) + 箱子壁(detected_box_panels, 受 args.box_obstacle 控制, 配置默认 True) + 相机碰撞体(camera_collision, 世界系 (0.7,0,1.2))。
     # box_homomat 来自实时检测到的箱子位姿（run_push_phase 传入 ctx.box_transform）。
     # 目标瓶子（被推物体）则以 obj_cmodel 形式传给 gen_pick_approach_only（与抓取规划一致），不额外加入 obstacle_list。
     if box_homomat is not None:
@@ -723,7 +783,7 @@ def plan_push(
         obstacle_list = []
         if not getattr(args, "no_env", False):
             obstacle_list.append(sim_pick.make_table_obstacle())
-        obstacle_list.append(make_robot_side_place_box_collision_obstacle(show_cdprim=False))
+        obstacle_list.append(make_camera_collision_obstacle(show_cdprim=False))
     print(f"[real_pipeline] push 规划障碍数: {len(obstacle_list)}")
 
     robot = sim_pick.make_robot()
@@ -737,6 +797,8 @@ def plan_push(
     pick_approach_jaw_width = pick_approach_jaw_width_for_grasp(robot, grasp)
 
     planner = ppp.PickPlacePlanner(robot)
+    planner.im_planner.toggle_mesh = False
+    planner.rrtc_planner.toggle_mesh = False
     obj_cmodel = make_fresh_pick_object_model(object_model_path, (push_pos, push_rotmat), name="push_obj_model")
 
     # ===== 生成 push 路径：先 RRT 关节空间规划到“接近起点(standoff)”，再由力控段到位 =====
@@ -763,23 +825,21 @@ def plan_push(
             print("[real_pipeline] ⚠️ push 规划警告：contact 单次 IK 不可解，退回以 standoff 作为接触标记"
                   "（力控段仍按 方向+距离 推进到实际接触点）")
             contact_jv = np.asarray(standoff_jv, dtype=float).reshape(-1)
-        # RRT：起始 → standoff（与抓取规划一致，use_rrt）
-        if sim_pick.USE_RRT:
-            robot.change_ee_values(ee_values=pick_approach_jaw_width)
+        # 先尝试项目现有的逐点碰撞检查插值；被阻挡时再回退 RRT。
+        robot.change_ee_values(ee_values=pick_approach_jaw_width)
+        start2standoff = planner.im_planner.gen_interplated_between_given_conf(
+            start_jnt_values=sim_pick.DEFAULT_HOME_CONF,
+            end_jnt_values=np.asarray(standoff_jv, dtype=float).reshape(-1),
+            obstacle_list=obstacle_list + [obj_cmodel],
+            ee_values=pick_approach_jaw_width,
+        )
+        if start2standoff is None and sim_pick.USE_RRT:
             start2standoff = planner.rrtc_planner.plan(
                 start_conf=sim_pick.DEFAULT_HOME_CONF,
                 goal_conf=np.asarray(standoff_jv, dtype=float).reshape(-1),
                 obstacle_list=obstacle_list + [obj_cmodel],
                 ext_dist=0.3,
                 max_time=100,
-                toggle_dbg=False,
-            )
-        else:
-            start2standoff = planner.im_planner.gen_interplated_between_given_conf(
-                start_jnt_values=sim_pick.DEFAULT_HOME_CONF,
-                end_jnt_values=np.asarray(standoff_jv, dtype=float).reshape(-1),
-                obstacle_list=obstacle_list + [obj_cmodel],
-                ee_values=pick_approach_jaw_width,
                 toggle_dbg=False,
             )
         if start2standoff is None:
@@ -810,7 +870,7 @@ def plan_push(
         # push 力控参数统一从 constants.py 的 REAL_PIPELINE_CONFIG（push_compliant_* 段）读取，
         # 不再依赖 args.compliant_*（那批键本未定义，运行期会 AttributeError）。
         compliant_force=float(REAL_PIPELINE_CONFIG.get("push_compliant_force", 40.0)),
-        compliant_vel=float(REAL_PIPELINE_CONFIG.get("push_compliant_vel", 0.06)),
+        compliant_vel=float(REAL_PIPELINE_CONFIG.get("push_compliant_vel", 0.1)),
         compliant_lateral_tolerance=float(REAL_PIPELINE_CONFIG.get("push_compliant_lateral_tolerance", 0.01)),
         compliant_lateral_stop_tolerance=REAL_PIPELINE_CONFIG.get("push_compliant_lateral_stop_tolerance", "auto"),
         compliant_force_frame=REAL_PIPELINE_CONFIG.get("push_compliant_force_frame", "direction"),
@@ -957,9 +1017,16 @@ def build_and_save_rtde_plan(args: SimpleNamespace, planning: PlanningResult, de
         place_press_timeout=REAL_PIPELINE_CONFIG.get("place_press_timeout", None),
         place_press_dwell_after_stop=float(REAL_PIPELINE_CONFIG.get("place_press_dwell_after_stop", 2.0)),
         transfer_movel_waypoints_world=getattr(planning.mot_data, "transfer_movel_waypoints_world", None),
-        # moveL 放置目标：机器人基坐标系下的 TCP 位置（真实机器人标定值），
-        # 不再使用仿真 world 放置点 BOTTLE_ROBOT_SIDE_PLACE_POS 的 world->base 换算结果。
-        transfer_movel_place_pos_base=list(BOTTLE_ROBOT_SIDE_PLACE_POSE_pos),
+        transfer_movel_vel=float(REAL_PIPELINE_CONFIG.get("slow_v", 0.5)),
+        transfer_movel_acc=float(REAL_PIPELINE_CONFIG.get("slow_a", 0.5)),
+        # 移到放置点上方
+        j1_swing_vel=float(REAL_PIPELINE_CONFIG.get("slow_v", 0.5)),
+        j1_swing_acc=float(REAL_PIPELINE_CONFIG.get("slow_a", 0.5)),
+        # moveL 放置目标：机器人基坐标系下的 TCP 位置（真实机器人标定值）。
+        # 第三段 moveL 终点固定为 BOTTLE_ROBOT_SIDE_PLACE_POSE（基系 6D 位姿），不再计算；
+        # 第二段 swing 仅按该位姿的基系方位角对齐，第三段 moveL 直接落到该固定位姿。
+        transfer_movel_place_pos_base=list(BOTTLE_ROBOT_SIDE_PLACE_POSE[:3]),
+        fixed_place_pose_base=list(BOTTLE_ROBOT_SIDE_PLACE_POSE),
     )
     rtde_plan.metadata["path_type"] = "pick_place_movel"
     rtde_plan_path = args.rtde_plan_out
@@ -983,8 +1050,8 @@ def resolve_place_pose(
     pick_pose: tuple[np.ndarray, np.ndarray],
 ) -> tuple[tuple[np.ndarray, np.ndarray], str, str]:
     if args.place_pos is None:
-        place_pos = np.asarray(BOTTLE_ROBOT_SIDE_PLACE_POS, dtype=float).copy()
-        place_pos_source = f"constants.BOTTLE_ROBOT_SIDE_PLACE_POS {sim_pick.format_vec(BOTTLE_ROBOT_SIDE_PLACE_POS, digits=3)}"
+        place_pos = np.asarray(BOTTLE_ROBOT_SIDE_PLACE_POSE, dtype=float)[:3].copy()
+        place_pos_source = f"constants.BOTTLE_ROBOT_SIDE_PLACE_POSE (pos) {sim_pick.format_vec(BOTTLE_ROBOT_SIDE_PLACE_POSE[:3], digits=3)}"
     else:
         place_pos = np.asarray(args.place_pos, dtype=float)
         place_pos_source = "--place-pos"

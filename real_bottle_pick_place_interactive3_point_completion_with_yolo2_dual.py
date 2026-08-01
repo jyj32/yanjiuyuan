@@ -12,42 +12,33 @@ WRS key workflow:
 
 After every O attempt, press C again before any new D/P/O.
 """
-
 from __future__ import annotations
-import copy
-import json
 from pathlib import Path
-from types import SimpleNamespace
-import subprocess
 import sys
-import threading
-import queue
-from typing import Any, Optional
-import numpy as np
-import cv2
-
-from time import perf_counter, strftime
-import open3d as o3d
-import traceback
-
-from direct.gui.OnscreenText import OnscreenText
-from panda3d.core import TextNode, Notify, Vec3, Point3
-from wrs import mgm
-from wrs.robot_con.ur.ur7e_dh76_rtde import UR7EDH76_RTDE
-import wrs.visualization.panda.world as wd
-from yanjiuyuan import point_hint_segment as phs
-from yanjiuyuan.yolo_detect2 import BottleDetector
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WRS_ROOT = REPO_ROOT / "wrs"
 for root in (REPO_ROOT, WRS_ROOT):
     root_str = str(root)
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
-
-from yanjiuyuan.constants import BOX_CAPTURE_ROOT, BOTTLE_ROBOT_SIDE_PLACE_POS, BOTTLE_ROBOT_SIDE_PLACE_POSE_pos, CAMERA_TO_WORLD, PICK_LIFT_MAX_Z # noqa: E402
+import copy
+import json
+from types import SimpleNamespace
+import subprocess
+import threading
+import queue
+from typing import Any, Optional
+import numpy as np
+from time import perf_counter
+import open3d as o3d
+import traceback
+from wrs.robot_con.ur.ur7e_dh76_rtde import UR7EDH76_RTDE
+from yanjiuyuan import point_hint_segment as phs
+from yanjiuyuan.yolo_detect2 import BottleDetector
+from yanjiuyuan.constants import BOX_CAPTURE_ROOT, CAMERA_TO_WORLD, PICK_LIFT_MAX_Z # noqa: E402
 from yanjiuyuan import box_object_pointcloud_sam_completion_template_icp_with_yolo2 as box_object_icp  # noqa: E402
 from yanjiuyuan import connection_status as conn_status  # noqa: E402
+from yanjiuyuan import detect_grasp_success as grasp_check  # noqa: E402
 from yanjiuyuan import pick_place_rtde_utils as rtde_utils  # noqa: E402
 from yanjiuyuan import sim_pick_and_place as sim_pick  # noqa: E402
 from yanjiuyuan import sync_real_ur7e_mech_eye_box_env as sync_scene  # noqa: E402
@@ -57,7 +48,6 @@ import utils
 from wrs.drivers.devices.Mech_eye.Mech_camera import CaptureImage
 import real_bottle_pick_place_interactive3_point_completion_with_yolo2_dual as dual_pipeline  # noqa: E402
 from wrs import ppp
-from PIL import Image as _PILImage
 
 BOX_OBJECT_SCRIPT = Path(__file__).resolve().parent / "box_object_pointcloud_sam_completion_template_icp_with_yolo2.py"
 DEFAULT_OBJECT_MODEL_PATH = REAL_PIPELINE_CONFIG["bottle_stl"]
@@ -111,12 +101,6 @@ def current_action_sequence_key(args: SimpleNamespace) -> Optional[str]:
         return str(int(action_sequence))
     except (TypeError, ValueError):
         return str(action_sequence).strip()
-
-
-def action_sequence_settings_for_args(args: SimpleNamespace) -> dict[str, Any]:
-    # 已移除对 action_sequence_config.json 的依赖：抓取规划不再依据配置文件挑选特定
-    # 抓取/位姿，而是对任意检测到的瓶子位姿进行抓取（arbitrary-pose grasping）。
-    return {}
 
 
 def is_nullish_json_value(value: Any) -> bool:
@@ -276,7 +260,7 @@ def action_sequence_sam_task_settings(args: SimpleNamespace) -> Optional[dict[st
     sequence_key = current_action_sequence_key(args)
     if sequence_key is None:
         return None
-    settings = action_sequence_settings_for_args(args)
+    settings = {}
     raw_points = raw_points_from_action_sequence_settings(settings)
     if not raw_points:
         return None
@@ -312,7 +296,7 @@ def action_sequence_template_id(settings: dict[str, Any]) -> Optional[str]:
 
 
 def apply_action_sequence_template_settings(args: SimpleNamespace) -> Optional[str]:
-    settings = action_sequence_settings_for_args(args)
+    settings = {}
     template_id = action_sequence_template_id(settings)
     args.bottle_template = "surface"
     args.bottle_template_prompt_gui = False
@@ -511,6 +495,7 @@ def build_box_object_args(args: SimpleNamespace, output_dir: Path) -> SimpleName
         "completion_selected_outlier_nb_neighbors",
         "completion_selected_outlier_std_ratio",
         "completion_selected_outlier_min_keep_ratio",
+        "save_perception_debug_outputs",
         "completion_bottle_icp",
         "completion_bottle_template",
         "completion_bottle_template_ply",
@@ -581,25 +566,31 @@ def capture_synced_context(
     current_jaw_width = None
     robot_status = None
     camera_status = None
+    rgb_image_bgr = None
 
     if fixed_start_conf_deg is not None:
         # ===== 双线程模式：跳过机器人连接，仅拍照 + 检测 =====
         print("[real_pipeline] (dual-thread) 跳过机器人连接，直接拍照。")
         with utils.timed_step("Mech capture"):
-            pcd, rgb_path, colored_ply_path, camera_status, pixel_indices, depth = conn_status.capture_mech_eye_pointcloud_checked(
+            pcd, rgb_path, colored_ply_path, camera_status, pixel_indices, rgb_image_bgr, depth = conn_status.capture_mech_eye_pointcloud_checked(
                 output_dir=output_dir,
                 ply_out=sync_args.ply_out,
                 depth_scale=sync_args.depth_scale,
                 depth_trunc=sync_args.depth_trunc,
                 save_ply=sync_args.save_ply,
                 return_pixel_indices=True,
+                return_rgb=True,
                 return_depth=True,
+                save_rgb=bool(getattr(args, "save_capture_rgb", False)),
 
                 camera=camera_instance,  # 传入相机实例，避免重复连接
             )
     else:
         # ===== 原始模式：连接机器人 + 拍照 + 读取状态 =====
-        provider = sync_scene.make_robot_provider(sync_args)
+        # 复用进程级单例 RTDE 会话（get_rtde_robot），避免与 startup / 其它调用的
+        # 会话同时占用 RTDE input registers 而报 "already in use"。
+        # 以 robot_x= 传入表示“借用”，provider.close() 不会断开共享连接。
+        provider = sync_scene.make_robot_provider(sync_args, robot_x=get_rtde_robot(args))
         try:
             robot_status = conn_status.check_robot_provider(provider, mock=args.mock)
             conn_status.print_status(robot_status, prefix="[real_pipeline]")
@@ -613,14 +604,16 @@ def capture_synced_context(
             provider.suspend()
             # 相机拍照
             with utils.timed_step("Mech capture"):    # 1.3733s
-                pcd, rgb_path, colored_ply_path, camera_status, pixel_indices, depth = conn_status.capture_mech_eye_pointcloud_checked(
+                pcd, rgb_path, colored_ply_path, camera_status, pixel_indices, rgb_image_bgr, depth = conn_status.capture_mech_eye_pointcloud_checked(
                     output_dir=output_dir,
                     ply_out=sync_args.ply_out,
                     depth_scale=sync_args.depth_scale,
                     depth_trunc=sync_args.depth_trunc,
                     save_ply=sync_args.save_ply,
                     return_pixel_indices=True,
+                    return_rgb=True,
                     return_depth=True,
+                    save_rgb=bool(getattr(args, "save_capture_rgb", False)),
 
                     camera=camera_instance,  # 传入相机实例，避免重复连接
                 )
@@ -631,7 +624,10 @@ def capture_synced_context(
             world_ply_path = output_dir / "world_colored_pointcloud.ply" if sync_args.save_ply else None
             if world_ply_path is not None:
                 sync_scene.save_numpy_pointcloud(points_world, colors, world_ply_path)
-            print(f"Saved RGB image to: {rgb_path}")
+            if rgb_path is not None:
+                print(f"Saved RGB image to: {rgb_path}")
+            else:
+                print("[real_pipeline] RGB image kept in memory; PNG write skipped.")
             if colored_ply_path is not None:
                 print(f"Saved camera-frame colored point cloud to: {colored_ply_path}")
             if world_ply_path is not None:
@@ -681,7 +677,10 @@ def capture_synced_context(
         world_ply_path = output_dir / "world_colored_pointcloud.ply" if sync_args.save_ply else None
         if world_ply_path is not None:
             sync_scene.save_numpy_pointcloud(points_world, colors, world_ply_path)
-        print(f"Saved RGB image to: {rgb_path}")
+        if rgb_path is not None:
+            print(f"Saved RGB image to: {rgb_path}")
+        else:
+            print("[real_pipeline] RGB image kept in memory; PNG write skipped.")
         if colored_ply_path is not None:
             print(f"Saved camera-frame colored point cloud to: {colored_ply_path}")
         if world_ply_path is not None:
@@ -713,11 +712,12 @@ def capture_synced_context(
             current_jnt_values, current_tcp_pos, current_jaw_width = robot_state_override
         else:
             try:
-                rtde_robot_temp = UR7EDH76_RTDE(robot_ip=args.robot_ip, gp_port=args.gp_port)
+                # 复用进程级单例 RTDE 会话读取机器人状态；不得新建/断开，
+                # 否则会与主线程/其它调用的会话抢 RTDE input registers。
+                rtde_robot_temp = get_rtde_robot(args)
                 current_jnt_values = np.asarray(rtde_robot_temp.get_jnt_values(), dtype=float)
                 current_tcp_pos, _ = rtde_robot_temp.fk(jnt_values=current_jnt_values)
                 current_jaw_width = float(np.asarray(rtde_robot_temp.get_gripper_width(), dtype=float))
-                rtde_robot_temp.disconnect()
             except Exception as e:
                 print(f"[real_pipeline] Warning: Failed to read robot state for summary: {e}")
                 current_jnt_values = np.zeros(6, dtype=float)
@@ -745,8 +745,8 @@ def capture_synced_context(
     elif current_jnt_values is not None:
         args.start_conf_deg = np.degrees(np.asarray(current_jnt_values, dtype=float))
 
-    if scene_data.rgb_path is None:
-        raise RuntimeError("C sync did not save an RGB image for SAM segmentation.")
+    if scene_data.rgb_path is None and rgb_image_bgr is None:
+        raise RuntimeError("C sync did not return RGB data for SAM segmentation.")
     capture = box_object_icp.CaptureData(
         pcd_world=None,
         points_world=scene_data.points_world,
@@ -758,6 +758,7 @@ def capture_synced_context(
         depth=depth,
         frame="world" if scene_data.world_ply_path is not None else "world_memory",
         pixel_indices=scene_data.pixel_indices,
+        rgb_image_bgr=np.asarray(rgb_image_bgr, dtype=np.uint8) if rgb_image_bgr is not None else None,
     )
     ctx = prepare_interactive_pipeline_context(args, capture=capture)
     metadata = {
@@ -967,9 +968,6 @@ def run_or_reuse_object_icp(args: SimpleNamespace) -> ObjectIcpResult:
     return read_object_summary(output_dir / "box_object_extraction_summary.json")
 
 
-
-
-
 def cuda_device_from_ultralytics_device(device: Any) -> Optional[str]:
     if device is None:
         return None
@@ -1027,6 +1025,112 @@ def preload_yolo_model(args: SimpleNamespace) -> None:
     print("[real_pipeline] YOLO model loaded.")
 
 
+def preload_priority_model(args: SimpleNamespace) -> None:
+    """Load the grasp-priority network before the first timed capture."""
+    if getattr(args, "no_yolo", False):
+        return
+    print("[real_pipeline] Loading grasp-priority model at startup...")
+    model, config, device, _helpers, _prototype = box_object_icp._load_priority_model_cached(args)
+    image_size = int(config["image_size"])
+    torch_module = box_object_icp.torch
+    dummy_batch = {
+        "rgb": torch_module.zeros((1, 3, image_size, image_size), device=device),
+        "depth": torch_module.zeros((1, 2, image_size, image_size), device=device),
+        "quads": torch_module.tensor(
+            [[[0.0, 0.0], [image_size - 1.0, 0.0],
+              [image_size - 1.0, image_size - 1.0], [0.0, image_size - 1.0]]],
+            dtype=torch_module.float32,
+            device=device,
+        ),
+        "geometry": torch_module.zeros((1, 18), device=device),
+        "candidate_batch_idx": torch_module.zeros((1,), dtype=torch_module.long, device=device),
+    }
+    with torch_module.inference_mode():
+        model(dummy_batch)
+    if device.type == "cuda":
+        torch_module.cuda.synchronize(device)
+    print("[real_pipeline] Grasp-priority model loaded and warmed.")
+
+
+def preload_adapointr_model(args: SimpleNamespace) -> None:
+    """Load AdaPoinTr weights before the first timed capture."""
+    if not getattr(args, "completion_matching", False):
+        return
+    print("[real_pipeline] Loading AdaPoinTr model at startup...")
+    completion_module = box_object_icp.completion_matching._load_adapointr_module(
+        args.completion_adapointr_script
+    )
+    params = SimpleNamespace(
+        checkpoint=str(args.completion_adapointr_checkpoint),
+        num_points=int(args.completion_num_points),
+        num_query=int(args.completion_num_query),
+    )
+    model = completion_module._get_adapointr_model(
+        params,
+        completion_module.torch.device(str(args.completion_device)),
+    )
+    device = completion_module.torch.device(str(args.completion_device))
+    dummy_points = completion_module.torch.zeros(
+        (1, int(args.completion_network_input_points), 3),
+        dtype=completion_module.torch.float32,
+        device=device,
+    )
+    with completion_module.torch.inference_mode():
+        model(dummy_points)
+    if device.type == "cuda":
+        completion_module.torch.cuda.synchronize(device)
+    print("[real_pipeline] AdaPoinTr model loaded and warmed.")
+
+
+# ============================================================================
+# RTDE 共享会话管理（长连接复用）
+# ----------------------------------------------------------------------------
+# UR7EDH76_RTDE.__init__ 构造时会建立 3 个 RTDE 接口（control / receive / io），
+# 而 RTDEIOInterface 一旦建立若不显式 disconnect，input registers 会被持续占用，
+# 导致后续再 new RTDEIOInterface() 报
+#   "One of the RTDE input registers are already in use!"。
+# 因此本流水线全程只维护【一个】UR7EDH76_RTDE 实例：外层建连一次、所有动作函数
+# 复用、最外层 finally 统一断开，即可既避免每次动作的重复握手开销，又不触发寄存器冲突。
+# ============================================================================
+_rtde_robot_shared = None
+
+
+def get_rtde_robot(args: SimpleNamespace):
+    """获取（懒加载）全局共享的 RTDE 会话；非空则直接复用，不重复建连。"""
+    global _rtde_robot_shared
+    if _rtde_robot_shared is not None:
+        return _rtde_robot_shared
+    _rtde_robot_shared = UR7EDH76_RTDE(robot_ip=args.robot_ip, gp_port=args.gp_port)
+    return _rtde_robot_shared
+
+
+def reset_rtde_robot(args: SimpleNamespace = None):
+    """销毁并重建共享会话（急停 / 连接断开后调用，供后续动作拿到干净连接）。
+
+    注意：此函数只重建 TCP 会话，无法清除 UR 控制器侧的 protective stop；
+    真机保护性停机仍需操作员在示教器上确认复位。
+    """
+    global _rtde_robot_shared
+    if _rtde_robot_shared is not None:
+        try:
+            _rtde_robot_shared.disconnect()
+        except Exception:
+            pass
+        _rtde_robot_shared = None
+    return get_rtde_robot(args) if args is not None else None
+
+
+def disconnect_rtde_robot() -> None:
+    """最外层统一断开共享会话（在流水线 finally 中调用一次）。"""
+    global _rtde_robot_shared
+    if _rtde_robot_shared is not None:
+        try:
+            _rtde_robot_shared.disconnect()
+        except Exception as exc:
+            print(f"[real_pipeline] Warning: RTDE disconnect failed: {exc}")
+        _rtde_robot_shared = None
+
+
 def move_to_grasp_start(args: SimpleNamespace) -> None:
     """在拍照/抓取前将机器人运动到抓取起点（抓取起点 = 拍照位）关节位置。
 
@@ -1042,25 +1146,19 @@ def move_to_grasp_start(args: SimpleNamespace) -> None:
 
     dry_run = bool(getattr(args, "execute_dry_run", False) or getattr(args, "mock", False))
     mode = "dry-run" if dry_run else "REAL ROBOT"
-    print(f"[real_pipeline] 回归抓取起点 ({mode})，目标关节角(弧度): {np.round(home_conf_rad, 4).tolist()}")
+    print(f"[real_pipeline] 回归抓取起点")
 
     if dry_run:
         print("[real_pipeline] Dry-run: 跳过实际运动。")
         return
-    rtde_robot = UR7EDH76_RTDE(
-        robot_ip=args.robot_ip,
-        gp_port=args.gp_port,
+    rtde_robot = get_rtde_robot(args)
+    rtde_robot.move_jnts(
+        home_conf_rad,
+        vel=REAL_PIPELINE_CONFIG['fast_v'],
+        acc=REAL_PIPELINE_CONFIG['fast_a'],
+        wait=True,
     )
-    try:
-        rtde_robot.move_jnts(home_conf_rad, vel=0.5, acc=0.5, wait=True)
-        print("[real_pipeline] 已运动到抓取起点。")
-    finally:
-        disconnect = getattr(rtde_robot, "disconnect", None)
-        if disconnect is not None:
-            try:
-                disconnect()
-            except Exception as exc:
-                print(f"[real_pipeline] Warning: RTDE disconnect failed: {exc}")
+    print("[real_pipeline] 已运动到抓取起点。")
 
 def move_to_capture_point(args: SimpleNamespace) -> None:
     """在拍照前将机器人运动到独立的拍照点（capture_conf_rad）关节位置。
@@ -1079,28 +1177,24 @@ def move_to_capture_point(args: SimpleNamespace) -> None:
 
     dry_run = bool(getattr(args, "execute_dry_run", False) or getattr(args, "mock", False))
     mode = "dry-run" if dry_run else "REAL ROBOT"
-    print(f"[real_pipeline] 回归拍照点 ({mode})，目标关节角(弧度): {np.round(conf_rad, 4).tolist()}")
+    print(f"[real_pipeline] 回归拍照点")
 
     if dry_run:
         print("[real_pipeline] Dry-run: 跳过实际运动。")
         return
-    rtde_robot = UR7EDH76_RTDE(
-        robot_ip=args.robot_ip,
-        gp_port=args.gp_port,
+    rtde_robot = get_rtde_robot(args)
+    rtde_robot.move_jnts(
+        conf_rad,
+        vel=REAL_PIPELINE_CONFIG['fast_v'],
+        acc=REAL_PIPELINE_CONFIG['fast_a'],
+        wait=True,
     )
-    try:
-        rtde_robot.move_jnts(conf_rad, vel=0.5, acc=0.5, wait=True)
-        print("[real_pipeline] 已运动到拍照点。")
-    finally:
-        disconnect = getattr(rtde_robot, "disconnect", None)
-        if disconnect is not None:
-            try:
-                disconnect()
-            except Exception as exc:
-                print(f"[real_pipeline] Warning: RTDE disconnect failed: {exc}")
+    print("[real_pipeline] 已运动到拍照点。")
 
 
-def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_place: callable = None) -> list:
+def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_place: callable = None, robot: Any = None) -> list:
+    # rtde_robot 通过 get_rtde_robot 复用全局共享会话（见文件顶部 RTDE 共享会话管理）；
+    # 此函数不再每次新建/断开连接，避免重复握手开销。
     """在真实机器人上执行 RTDE 抓取计划（同步执行）。
 
     Args:
@@ -1129,13 +1223,20 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
     compliant_mode = "moveL_compliant" if use_move_l_compliant else "joint-path approach"
     print(f"[real_pipeline] RTDE execution starting ({mode}, {compliant_mode})...")
 
-    rtde_robot = object()
+    # 仿真模型（含标定）：move_jnt1_swing 段用它按“真实关节角”推算当前 TCP 方位角，
+    # 与规划期 get_real_tcp_pose_from_conf 同帧；未传入 robot 且计划含 swing 段时惰性创建。
+    if robot is None and any(
+        s.command == "move_jnt1_swing" for s in planning.rtde_plan.segments
+    ):
+        robot = sim_pick.make_robot()
+
+    rtde_robot = object()  # dry-run 时沿用 object()，复用既有行为；非 dry-run 改用全局共享会话
+    # 放置前抓取确认用的后台 TCP 外力监控（抬升到抓取高位时启动 → 到放置点上方时取结果）。
+    # 定义在 try 之外，保证 except/finally 里一定能拿到并停掉线程。
+    _force_monitor = None
     try:
         if not dry_run:
-            rtde_robot = UR7EDH76_RTDE(
-                robot_ip=args.robot_ip,
-                gp_port=args.gp_port,
-            )
+            rtde_robot = get_rtde_robot(args)
             print("[real_pipeline] Opening gripper before RTDE execution...")
             rtde_robot.open_gripper()
         else:
@@ -1144,6 +1245,7 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
         # 逐 segment 执行 RTDE 计划
         log = []
         transfer_trigger_fired = False
+        force_checked = False  # 放置前「TCP 外力抓取确认」是否已执行一次
         # 物料搬运段：标记了 anchor_to_actual_tcp 的三段 moveL，执行时以
         # 【实际 TCP 位姿】为基准重算目标位姿（仿真 fk 位姿与真实机器人有标定偏差）。
         transfer_segments = [
@@ -1165,10 +1267,19 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
                 print(f"[real_pipeline] 🎥 {_trig_where}，触发下一轮拍照+处理（与下落/松手并行）...")
                 on_transfer_to_place()
 
+            # 放置点上方、下落前获取结果有无抓住
+            if (not dry_run) and (not force_checked) and segment.metadata.get("transfer_role") == 3:
+                force_checked = True
+                _has_obj = grasp_check.confirm_grasp(rtde_robot, _force_monitor)
+                _force_monitor = None
+                if not _has_obj:    # 没有抓住
+                    grasp_check.abort_place(rtde_robot)
+                    break  # 跳出 segment 循环；后续由调用方 move_to_capture_point + move_to_grasp_start
+
             # ---- 以【实际 TCP 位姿】为基准重算物料搬运三段 moveL 目标位姿 ----
             # 机器人在 close_gripper 之后已到达抓取点，此刻读取真实 TCP 位姿，
-            # 由其派生：① 竖直 +Z 抬起 ② 水平移到放置点正上方（姿态保持抓取姿态）
-            # ③ 竖直下落到放置点（姿态保持抓取姿态）。这样搬运路径锚定在真实位姿，
+            # 由其派生：① 竖直 +Z 抬起 ② 水平移到放置点正上方
+            # ③ 竖直下落到放置点。这样搬运路径锚定在真实位姿，
             # 不受仿真/真实标定偏差影响。仅在实机（非 dry-run）下执行一次。
             if (
                 not dry_run
@@ -1192,9 +1303,23 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
                             f"grasp=({_ax:.4f},{_ay:.4f},{_az:.4f}), "
                             f"lift_z={_lift_z:.4f}, above/place=({_px:.4f},{_py:.4f},{_pz:.4f})"
                         )
-                        _wp1 = [_ax, _ay, _lift_z, _arx, _ary, _arz]
-                        _wp2 = [_px, _py, min(_lift_z, 0.63), _arx, _ary, _arz]
-                        _wp3 = [_px, _py, _pz, _arx, _ary, _arz]
+                        # 第三段（lower to place）姿态 = 第二段终点真实法兰盘姿态（关节1旋转后），
+                        # 取自第三段段元数据 swing_end_rotvec（规划期由 get_real_tcp_pose_from_conf 计算，
+                        # 与执行端 move_jnt1_swing 同算法）；缺省回退抓取点真实姿态（predicted_grasp_real_tcp）。
+                        # 放置高点（above_place，第二段终点）与放置点（第三段落点）姿态保持一致：
+                        # 两者都用 swing_end_rotvec，满足“放置点姿态 = 放置高点姿态”的约束。
+                        _wp3_seg = next(
+                            (_s for _s in transfer_segments if _s.metadata.get("transfer_role") == 3), None
+                        )
+                        _swing_rv = _wp3_seg.metadata.get("swing_end_rotvec") if _wp3_seg is not None else None
+                        if _swing_rv is not None and len(_swing_rv) == 3:
+                            _prx, _pry, _prz = [float(_v) for _v in _swing_rv]
+                        else:
+                            _prx, _pry, _prz = _arx, _ary, _arz
+                            print("[real_pipeline] ⚠️ 第三段无 swing_end_rotvec，回退抓取点真实姿态")
+                        _wp1 = [_ax, _ay, _lift_z, _arx, _ary, _arz]              # 抬升段：抓取点真实姿态
+                        _wp2 = [_px, _py, _lift_z, _prx, _pry, _prz]             # 放置高点：第二段终点姿态
+                        _wp3 = [_px, _py, _pz, _prx, _pry, _prz]                 # 放置点：与放置高点姿态相同
                         for _s in transfer_segments:
                             _role = _s.metadata.get("transfer_role")
                             _s.pose = list(_wp1 if _role == 1 else _wp2 if _role == 2 else _wp3)
@@ -1214,30 +1339,27 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
             # 会 KeyError 回退并把 FK 规划位姿误当实际位姿，导致 moveL 冲向错误位置触发保护停）。
             # 这里单独在 push_leave 段执行前，读取真实 TCP 位姿（基系 6D），仅抬 Z 分量
             # depart_distance、保持姿态，保证离开方向竖直向上、且从机器人“此刻真实所在”出发。
-            if (
-                not dry_run
-                and segment.metadata.get("path_type") == "push_leave"
-            ):
-                # 用规划阶段预计算的 push 末端真实位姿
-                _pred = segment.metadata.get("predicted_real_tcp")
-                # ⭐ 若本计划含“往箱子中心推”的力控段（push_to_center_compliant），力控推完后
-                # 实际 XY 已偏离接触点且行程不确定（可能提前触力软停），预计算的接触点位姿
-                # 不再是机器人“此刻真实所在”——改为运行时读取实际 TCP 位姿，仅抬 Z 竖直离开，
-                # 避免 moveL 横向拖回接触点。读取失败时回退预计算位姿。
-                _has_center_push = any(
-                    s.metadata.get("path_type") == "push_center" for s in planning.rtde_plan.segments
-                )
-                if _has_center_push:
+            if (not dry_run and segment.metadata.get("path_type") == "push_leave"):
+                # ⭐ 无条件始终优先用运行时实际 TCP 位姿（getActualTCPPose）锚定竖直上抬：
+                # 无论是否含“往箱子中心推”的力控段，力控推完/离开后实际 XY 都与规划接触点存在偏差，
+                # 预计算的接触点位姿不再代表机器人“此刻真实所在”，必须读取真实 TCP 仅抬 Z 竖直离开，
+                # 避免 moveL 横向拖回接触点 / 错位（SIM 帧回退还有 ~180° 偏航风险）。
+                # 仅在 getActualTCPPose() 读取失败时才回退预计算的 predicted_real_tcp。
+                _actual = None
+                try:
+                    _actual = np.asarray(rtde_robot.getActualTCPPose(), dtype=float).reshape(6)
+                    print("[real_pipeline] 📍 push_leave 无条件使用运行时实际 TCP 位姿锚定竖直上抬")
+                except Exception as _exc:
+                    print(f"[real_pipeline] ⚠️ push_leave 读取实际 TCP 失败，尝试回退预计算真实位姿: {_exc}")
+                if _actual is None:
+                    _pred = segment.metadata.get("predicted_real_tcp")
+                    if _pred is None:
+                        print("[real_pipeline] ⚠️ push_leave 无预计算真实位姿，回退使用规划航点")
+                    else:
+                        _actual = np.asarray(_pred, dtype=float).reshape(6)
+                        print("[real_pipeline] 📍 push_leave 回退使用预计算真实位姿锚定竖直上抬")
+                if _actual is not None:
                     try:
-                        _pred = np.asarray(rtde_robot.getActualTCPPose(), dtype=float).reshape(6).tolist()
-                        print("[real_pipeline] 📍 push_leave 存在中心推段，改用运行时实际 TCP 位姿锚定上抬")
-                    except Exception as _exc:
-                        print(f"[real_pipeline] ⚠️ push_leave 读取实际 TCP 失败，回退预计算位姿: {_exc}")
-                if _pred is None:
-                    print("[real_pipeline] ⚠️ push_leave 无预计算真实位姿，回退使用规划航点")
-                else:
-                    try:
-                        _actual = np.asarray(_pred, dtype=float).reshape(6)  # 基坐标系 6D: x,y,z,rx,ry,rz
                         _dep = float(segment.metadata.get("depart_distance", 0.0))
                         _lift_z = min(float(_actual[2]) + _dep, PICK_LIFT_MAX_Z)  # 限制高度，避免超出可达
                         segment.pose = [
@@ -1245,11 +1367,11 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
                             float(_actual[3]), float(_actual[4]), float(_actual[5]),
                         ]
                         print(
-                            f"[real_pipeline] 📍 push_leave 以预计算真实位姿竖直上抬: "
+                            f"[real_pipeline] 📍 push_leave 竖直上抬: "
                             f"z {float(_actual[2]):.4f} → {_lift_z:.4f}"
                         )
                     except Exception as _exc:
-                        print(f"[real_pipeline] ⚠️ push_leave 使用预计算真实位姿失败，回退使用规划航点: {_exc}")
+                        print(f"[real_pipeline] ⚠️ push_leave 使用实际位姿失败，回退使用规划航点: {_exc}")
 
             print(f"[real_pipeline]   执行 segment {segment_idx}: {segment.name}")
             segment_start = perf_counter()
@@ -1259,6 +1381,13 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
                 rtde_robot=rtde_robot,
                 plan=rtde_utils.RtdeExecutionPlan(segments=[segment]),
                 dry_run=dry_run,
+                robot=robot,  # 仿真模型（含标定），move_jnt1_swing 用其推算当前 TCP 方位角
+                jntspace_kwargs={
+                    "vel": REAL_PIPELINE_CONFIG["fast_v"],
+                    "acc": REAL_PIPELINE_CONFIG["fast_a"],
+                    "toppra_vels": [REAL_PIPELINE_CONFIG["fast_v"]]*6,
+                    "toppra_accs": [REAL_PIPELINE_CONFIG["fast_a"]]*6,
+                },
                 max_start_joint_error=np.radians(float(args.max_start_joint_error_deg)),
                 use_move_l_compliant=use_move_l_compliant,  # 是否使用力控
                 # 力控段允许的正常停下原因：到达距离 / 接触物体(max_tcp_force) / 卡住(stalled) / 侧向顺从(lateral_deviation)
@@ -1271,18 +1400,42 @@ def execute_rtde_plan_direct(planning, args: SimpleNamespace, on_transfer_to_pla
 
             print(f"[real_pipeline]   ✅ {segment.name} 完成 ({segment_elapsed:.2f}s)")
 
+            # ---- 启动后台 TCP 外力采样（判抓，详见 detect_grasp_success.py）----
+            # 时机：第①段搬运 moveL（transfer_role==1，抓取后竖直抬升到抓取高位）刚执行完。
+            # 此刻夹爪已闭合、物体已离开桌面完全由夹爪承担，外力中的物体重力分量已建立。
+            # 采样在后台线程进行，与随后的第②段关节1摆动（→放置点正上方）并行，主线程不阻塞等待。
+            # 结果在下一轮 transfer_role==3（放置点正上方、lower to place 前）判定点取用。
+            if (
+                not dry_run
+                and _force_monitor is None
+                and not force_checked
+                and segment.metadata.get("transfer_role") == 1
+            ):  # 抬升到抓取高位后开始检测力
+                _force_monitor = grasp_check.start_monitor(rtde_robot)
+
         print(f"[real_pipeline] RTDE execution complete ({mode}, {compliant_mode}): {len(log)} segment(s).")
         for entry in log:
             print(f"[real_pipeline]   {entry['name']}: {entry.get('elapsed', 0):.2f}s")
         return log
 
-    finally:
-        disconnect = getattr(rtde_robot, "disconnect", None)
-        if disconnect is not None:
+    except Exception as exc:
+        print(f"[real_pipeline] ❌ RTDE 执行异常: {exc}")
+        traceback.print_exc()
+        # 执行失败（含 protective stop / 连接断开）：重建共享会话，供后续动作使用。
+        # 注意：仅重建 TCP 会话，无法清除 UR 控制器侧 protective stop（需操作员示教器复位）。
+        if not dry_run:
             try:
-                disconnect()
-            except Exception as exc:
-                print(f"[real_pipeline] Warning: RTDE disconnect failed: {exc}")
+                reset_rtde_robot(args)
+            except Exception:
+                pass
+        return log
+
+    # 注意：rtde_robot 为共享会话，此处不主动 disconnect，
+    # 由主流程（main 的 run_grasp finally）统一断开，避免每次执行重复握手。
+    finally:
+        # 停掉后台 TCP 外力采样线程
+        grasp_check.stop_monitor(_force_monitor)
+        _force_monitor = None
 
 
 def run_push_phase(
@@ -1306,7 +1459,7 @@ def run_push_phase(
            不搬运到放置点、不放置力控下压。
         5. 不维护“已推开”去重集合：每次外层循环重新检测，按当前检测顺序推；
            若某物体被推开后变为可抓取，下一轮会回到抓取分支；同一位姿被反复检测到的风险
-           由外层 max_outer_cycles 安全上限兜底。
+           外层循环在“本轮既无可抓取也无可推开”时自然结束。
 
     Args:
         ctx: 本 cycle 的 PipelineContext（抓取规划已写入 ctx.detections / ctx.push_object_poses）；
@@ -1374,15 +1527,6 @@ def run_push_phase(
     candidates_object_local = bool(REAL_PIPELINE_CONFIG.get("push_candidates_object_local", True))
 
     # ===== 在路径规划前，先对所有推开候选做“与抓取规划相同”的筛选 =====
-    # 复用抓取规划同一套筛选函数 planner.filter_grasps_sequence（wrs PickPlacePlanner）：
-    #   对每个 goal_pose（此处 = 物体 3D 位姿 obj_pose）依次做：
-    #     ① 手爪与障碍 mesh 碰撞 → ② IK 求解 → ③ 周围点云碰撞(raycasting) → ④ 机器人整体与障碍碰撞
-    #   返回对全部 goal_pose 都通过的候选 gid 列表。这一步只做“轻量可行性”判断（IK + 碰撞），
-    #   不做昂贵的 RRT 接近路径规划；仅对筛选通过的候选才调用 plan_push 做 RRT，显著提速。
-    # 筛选所用障碍体 / 周围点云与抓取规划（gen_pick_approach_only_path）完全一致：
-    #   障碍体 = build_obstacle_lists(args, box_homomat)（桌子+箱子壁+放置箱体）；
-    #   周围点云 = remaining_pointcloud.ply（除被操作物体外的场景点云，不含被推瓶子本身）。
-
     push_collection = sim_pick.make_grasp_collection(sim_robot, push_grasps)
 
     # 障碍列表：与 plan_push / 抓取规划一致（一次构建，所有物体复用）
@@ -1392,7 +1536,7 @@ def run_push_phase(
         obstacle_list = []
         if not getattr(args, "no_env", False):
             obstacle_list.append(sim_pick.make_table_obstacle())
-        obstacle_list.append(real_planning.make_robot_side_place_box_collision_obstacle(show_cdprim=False))
+        obstacle_list.append(real_planning.make_camera_collision_obstacle(show_cdprim=False))
     print(f"[push] 筛选碰撞体数: {len(obstacle_list)}（与抓取规划一致）")
 
     push_planner = ppp.PickPlacePlanner(sim_robot)
@@ -1505,421 +1649,79 @@ def run_push_phase(
     return pushed_count
 
 
-class GraspPlanViewer:
-    """一键抓取流水线结果查看器。
-
-    显示静态场景点云、障碍物、ICP 配准结果（模板点云、抓取/放置位姿）、
-    橙色 TCP 轨迹标记，以及逐帧机器人运动动画。
-    """
-
-    def __init__(self, ctx: box_object_icp.PipelineContext, result: dict, runtime_args: SimpleNamespace = None, world=None):
-
-        _task_cat = Notify.ptr().getCategory("task")
-        if _task_cat is not None:
-            _task_cat.setSeverity(5)
-
-        self.ctx = ctx
-        self.args = runtime_args if runtime_args is not None else ctx.args
-        self.planning = result["planning"]
-        self.icp_result = result["icp_result"]
-        self.mgm = mgm
-        self.static_models: list[object] = []
-        self.obstacle_models: list[object] = []
-        self.detection_models: list[object] = []
-        self.plan_models: list[object] = []
-        self.animation_data = None
-        self.animation_task_name = "grasp_plan_animation"
-        self.auto_execute_task_name = "auto_execute_rtde"
-        self.executed = False
-        self.executing = False
-        self.owns_world = world is None  # 是否由本 viewer 创建世界
-
-        # 兼容 SimpleNamespace 没有的字段
-        if not hasattr(ctx.args, "no_env"):
-            ctx.args.no_env = False
-        if not hasattr(ctx.args, "place_pos"):
-            ctx.args.place_pos = None
-        if not hasattr(ctx.args, "place_rpy_deg"):
-            ctx.args.place_rpy_deg = None
-
-        scene_points = ctx.capture.points_world[ctx.candidate_mask | ctx.removed_mask]
-        if len(scene_points) == 0:
-            scene_points = ctx.capture.points_world
-        cam_pos, lookat_pos, extent = box_object_icp.compute_camera_from_points(scene_points)
-
-        if world is not None:
-            self.base = world
-            # 复用已有世界时更新相机位置
-            self.base.cam.setPos(cam_pos[0], cam_pos[1], cam_pos[2])
-            self.base.cam.lookAt(
-                Point3(lookat_pos[0], lookat_pos[1], lookat_pos[2]),
-                Vec3(0, 0, 1),
-            )
-        else:
-            self.base = wd.World(cam_pos=cam_pos, lookat_pos=lookat_pos, w=1280, h=720)
-
-        frame_length = max(extent * 0.25, 0.03)
-        frame_radius = max(frame_length * 0.015, 0.0005)
-        mgm.gen_frame(ax_length=frame_length, ax_radius=frame_radius).attach_to(self.base)
-
-        self._attach_static_pointclouds()
-        self._attach_scene_obstacles()
-        self._attach_icp_result()
-        self._attach_plan_result()
-
-        frame_count = (
-            len(self.planning.mot_data.jv_list)
-            if hasattr(self.planning.mot_data, "jv_list")
-            else len(self.planning.mot_data)
-        )
-        self.status_text = OnscreenText(
-            text=(
-                f"Grasp plan ready: {frame_count} frames, "
-                f"grasp #{self.planning.selected_grasp_index}. "
-                f"RTDE: {self.planning.rtde_plan_path}"
-            ),
-            pos=(-1.28, 0.92),
-            align=TextNode.ALeft,
-            scale=0.044,
-            fg=(0.02, 0.02, 0.02, 1.0),
-            mayChange=True,
-        )
-        auto_execute = bool(getattr(self.args, "auto_execute", True))
-        if auto_execute and self.planning.rtde_plan is not None:
-            self.status_text.setText(
-                f"Grasp plan ready: {frame_count} frames, "
-                f"grasp #{self.planning.selected_grasp_index}. "
-                f"Animation will auto-execute RTDE plan after playback."
-            )
-            print(
-                "[real_pipeline] GraspPlanViewer ready. "
-                "Orange trail = planned TCP path; animated robot shows motion playback. "
-                "After animation, RTDE plan will auto-execute. "
-                "Press O to execute immediately, or close the window to exit."
-            )
-            self._schedule_auto_execute(frame_count)
-        else:
-            self.status_text.setText(
-                f"Grasp plan ready: {frame_count} frames, "
-                f"grasp #{self.planning.selected_grasp_index}. "
-                f"RTDE: {self.planning.rtde_plan_path}. Press O to execute."
-            )
-            print(
-                "[real_pipeline] GraspPlanViewer ready. "
-                "Orange trail = planned TCP path; animated robot shows motion playback. "
-                "Press O to execute RTDE plan, or close the window to exit."
-            )
-        self.base.accept("o", self.execute_rtde_plan)
-
-    # ---- static scene ----
-    def _attach_static_pointclouds(self) -> None:
-        args = self.ctx.args
-        candidate_points = self.ctx.capture.points_world[self.ctx.candidate_mask]
-        removed_points = self.ctx.capture.points_world[self.ctx.removed_mask]
-        candidate_points, _ = box_object_icp.voxel_downsample_arrays(
-            candidate_points, None, args.candidate_voxel,
-        )
-        removed_points, _ = box_object_icp.voxel_downsample_arrays(
-            removed_points, None, args.removed_voxel,
-        )
-        if len(removed_points) > 0:
-            model = self.mgm.gen_pointcloud(
-                removed_points,
-                rgba=np.array([0.55, 0.55, 0.55, 0.7]),
-                point_size=args.point_size,
-            )
-            model.attach_to(self.base)
-            self.static_models.append(model)
-        if len(candidate_points) > 0:
-            model = self.mgm.gen_pointcloud(
-                candidate_points,
-                rgba=np.array([0.0, 0.85, 0.15, 0.78]),
-                point_size=args.point_size,
-            )
-            model.attach_to(self.base)
-            self.static_models.append(model)
-
-    # ---- scene obstacles (box, table, place box) ----
-    def _attach_scene_obstacles(self) -> None:
-        try:
-            box_homomat = self.ctx.box_transform
-            _planning_obstacles, display_obstacles = build_obstacle_lists(
-                self.ctx.args, box_homomat, include_display=True,
-            )
-            for obstacle in display_obstacles:
-                obstacle.attach_to(self.base)
-                self.obstacle_models.append(obstacle)
-        except Exception as exc:
-            print(f"[real_pipeline] Warning: could not attach scene obstacles: {exc}")
-
-    # ---- ICP result (registered template, pick/place poses) ----
-    def _attach_icp_result(self) -> None:
-        try:
-            icp = self.icp_result
-
-            # global registered template points
-            if icp.global_registered_path is not None:
-                registered_pcd = o3d.io.read_point_cloud(str(icp.global_registered_path))
-                registered_points = np.asarray(registered_pcd.points, dtype=np.float64)
-                if len(registered_points) > 0:
-                    model = self.mgm.gen_pointcloud(
-                        registered_points,
-                        rgba=np.array([*box_object_icp.GLOBAL_REGISTERED_POINTS_RGB, 0.95]),
-                        point_size=max(self.ctx.args.point_size, 0.0035),
-                    )
-                    model.attach_to(self.base)
-                    self.detection_models.append(model)
-
-            pick_pose = utils.homomat_to_pose(bottle_homomat_for_icp(icp))
-            place_pose, _pos_src, _rot_src = resolve_place_pose(
-                self.ctx.args, pick_pose,
-            )
-
-            # pick / place bottle models
-            start_model = sim_pick.make_object_model(
-                icp.bottle_model_path,
-                pick_pose,
-                name="estimated_pick_start_bottle",
-                alpha=0.55,
-                rgb=np.array([1.0, 0.76, 0.18]),
-            )
-            start_model.attach_to(self.base)
-            start_model.show_cdprim()
-            self.detection_models.append(start_model)
-
-            place_model = sim_pick.make_object_model(
-                icp.bottle_model_path,
-                place_pose,
-                name="planned_place_goal_bottle",
-                alpha=0.32,
-                rgb=np.array([0.2, 0.9, 0.45]),
-            )
-            place_model.attach_to(self.base)
-            place_model.show_cdprim()
-            self.detection_models.append(place_model)
-
-            # coordinate frames and markers
-            for pose, color in (
-                (pick_pose, np.array([1.0, 0.76, 0.18])),
-                (place_pose, np.array([0.2, 0.9, 0.45])),
-            ):
-                frame = self.mgm.gen_frame(
-                    pos=pose[0], rotmat=pose[1], ax_length=0.085, ax_radius=0.002,
-                )
-                frame.attach_to(self.base)
-                self.detection_models.append(frame)
-                marker = self.mgm.gen_sphere(
-                    pos=pose[0], radius=0.01, rgb=color, alpha=0.85,
-                )
-                marker.attach_to(self.base)
-                self.detection_models.append(marker)
-
-            # arrow from pick to place
-            if np.linalg.norm(place_pose[0] - pick_pose[0]) > 1e-8:
-                arrow = self.mgm.gen_arrow(
-                    spos=pick_pose[0],
-                    epos=place_pose[0],
-                    rgb=np.array([0.2, 0.45, 1.0]),
-                    alpha=0.72,
-                    stick_radius=0.004,
-                )
-                arrow.attach_to(self.base)
-                self.detection_models.append(arrow)
-        except Exception as exc:
-            print(f"[real_pipeline] Warning: could not attach ICP result: {exc}")
-            traceback.print_exc()
-
-    # ---- plan result: trail markers + animation ----
-    def _attach_plan_result(self) -> None:
-        mot_data = self.planning.mot_data
-        if len(mot_data) == 0:
-            print("[real_pipeline] No motion frames to visualize.")
-            return
-
-        # draw TCP trail markers
-        marker_robot = sim_pick.make_robot()
-        marker_robot.backup_state()
-        try:
-            for index in range(0, len(mot_data), max(1, sim_pick.RESULT_TRAIL_STRIDE)):
-                jnt_values, ee_values, _obj_pose, _mesh = mot_data[index]
-                marker_robot.goto_given_conf(jnt_values=jnt_values, ee_values=ee_values)
-                marker = self.mgm.gen_sphere(
-                    pos=marker_robot.gl_tcp_pos,
-                    radius=0.006,
-                    rgb=np.array([1.0, 0.35, 0.05]),
-                    alpha=0.75,
-                )
-                marker.attach_to(self.base)
-                self.plan_models.append(marker)
-        finally:
-            marker_robot.restore_state()
-
-        self._start_motion_animation()
-
-    def _start_motion_animation(self) -> None:
-        object_model_path = self.planning.object_model_path
-
-        class AnimationData:
-            def __init__(self, motion_data):
-                self.counter = 0
-                self.motion_data = motion_data
-                self.robot = sim_pick.make_robot()
-                self.mesh_model = None
-                self.obj_model = None
-
-        data = AnimationData(self.planning.mot_data)
-        self.animation_data = data
-
-        def update(task):
-            # 可选：打印帧号以确认动画在运行（调试用）
-            # print(f"Animation frame {data.counter}/{len(data.motion_data)}")
-
-            # 移除上一帧的模型
-            for attr in ("mesh_model", "obj_model"):
-                model = getattr(data, attr, None)
-                if model is not None:
-                    for method_name in ("detach", "remove"):
-                        method = getattr(model, method_name, None)
-                        if method is not None:
-                            try:
-                                method()
-                                break
-                            except Exception:
-                                continue
-                    setattr(data, attr, None)
-
-            if data.counter >= len(data.motion_data):
-                data.counter = 0
-
-            jnt_values, ee_values, obj_pose, cached_mesh = data.motion_data[data.counter]
-            if cached_mesh is not None:
-                data.mesh_model = cached_mesh
-            else:
-                data.robot.goto_given_conf(jnt_values=jnt_values, ee_values=ee_values)
-                data.mesh_model = data.robot.gen_meshmodel(
-                    alpha=0.72,
-                    toggle_tcp_frame=True,
-                    toggle_flange_frame=False,
-                    toggle_jnt_frames=False,
-                )
-            if data.mesh_model is not None:
-                data.mesh_model.attach_to(self.base)
-
-            if obj_pose is not None and cached_mesh is None:
-                data.obj_model = sim_pick.make_object_model(
-                    object_model_path,
-                    (
-                        np.asarray(obj_pose[0], dtype=float),
-                        np.asarray(obj_pose[1], dtype=float),
-                    ),
-                    name="animated_held_object",
-                    alpha=0.65,
-                    rgb=np.array([0.95, 0.72, 0.18]),
-                )
-                data.obj_model.attach_to(self.base)
-
-            data.counter += 1
-            # 设置下一次调用的延迟（即帧间隔）
-            task.delayTime = sim_pick.RESULT_ANIMATION_INTERVAL
-            return task.again
-
-        # 只使用 add，任务首次将在下一帧执行
-        self.base.taskMgr.add(update, self.animation_task_name)
-
-    def _schedule_auto_execute(self, frame_count: int) -> None:
-        """动画播放一遍后自动执行 RTDE 计划。"""
-        interval = getattr(sim_pick, "RESULT_ANIMATION_INTERVAL", 0.05)
-        delay = frame_count * interval + 1.0  # 播完一遍 + 1秒缓冲
-
-        def auto_execute_task(task):
-            if self.executed or self.executing:
-                return task.done
-            print(f"[real_pipeline] Auto-executing RTDE plan after {delay:.1f}s animation playback.")
-            self.execute_rtde_plan()
-            return task.done
-
-        self.base.taskMgr.doMethodLater(
-            delay, auto_execute_task, self.auto_execute_task_name, appendTask=True
-        )
-        print(f"[real_pipeline] Auto-execute scheduled in {delay:.1f}s (after one full animation playback).")
-
-    def execute_rtde_plan(self) -> None:
-        """在真实机器人上执行 RTDE 抓取计划。"""
-        if self.executed:
-            print("[real_pipeline] RTDE plan already executed. Close window to exit.")
-            return
-        if self.executing:
-            print("[real_pipeline] Execution already in progress, please wait.")
-            return
-        if self.planning is None or self.planning.rtde_plan is None:
-            self.status_text.setText("No RTDE plan available. Cannot execute.")
-            print("[real_pipeline] No RTDE plan available to execute.")
-            return
-
-        self.executing = True
-        self.status_text.setText("Executing RTDE plan on real robot...")
-
-        # 停止动画
-        try:
-            self.base.taskMgr.remove(self.animation_task_name)
-        except Exception:
-            pass
-
-        dry_run = bool(getattr(self.args, "execute_dry_run", False) or getattr(self.args, "mock", False))
-        use_move_l_compliant = bool(getattr(self.args, "use_move_l_compliant", False))
-        mode = "dry-run" if dry_run else "REAL ROBOT"
-        compliant_mode = "moveL_compliant" if use_move_l_compliant else "joint-path approach"
-        print(f"[real_pipeline] O execution starting ({mode}, {compliant_mode})...")
-
-        rtde_robot = object()
-        try:
-            if not dry_run:
-                rtde_robot = UR7EDH76_RTDE(
-                    robot_ip=self.args.robot_ip,
-                    gp_port=self.args.gp_port,
-                )
-                print("[real_pipeline] Opening gripper before RTDE execution...")
-                rtde_robot.open_gripper()
-            else:
-                print("[real_pipeline] Dry-run: skipping pre-execution gripper open.")
-
-            log = rtde_utils.execute_rtde_execution_plan(
-                rtde_robot=rtde_robot,
-                plan=self.planning.rtde_plan,
-                dry_run=dry_run,
-                max_start_joint_error=np.radians(float(self.args.max_start_joint_error_deg)),
-                use_move_l_compliant=use_move_l_compliant,
-                # 力控段允许的正常停下原因：到达距离 / 接触物体(max_tcp_force) / 卡住(stalled) / 侧向顺从(lateral_deviation)
-                allowed_compliant_stop_reasons=("distance", "max_tcp_force", "stalled", "lateral_deviation"),
-            )
-            completion_text = f"O execution complete ({mode}, {compliant_mode}): {len(log)} segment(s)."
-            self.status_text.setText(f"{completion_text} Close window to exit.")
-            print(f"[real_pipeline] {completion_text}")
-            for entry in log:
-                print(f"[real_pipeline]   {entry}")
-        except Exception as exc:
-            self.status_text.setText(f"O execution failed: {exc}. Close window to exit.")
-            print(f"[real_pipeline] O execution failed: {exc}")
-            traceback.print_exc()
-        finally:
-            disconnect = getattr(rtde_robot, "disconnect", None)
-            if disconnect is not None:
-                try:
-                    disconnect()
-                except Exception as exc:
-                    print(f"[real_pipeline] Warning: RTDE disconnect failed: {exc}")
-            self.executed = True
-            self.executing = False
-
-    def run(self) -> None:
-        self.base.run()
-
-
 def should_run_interactive(args: SimpleNamespace) -> bool:
     if args.interactive is not None:
         return bool(args.interactive)
     return args.object_summary is None and not bool(args.dry_run)
 
+
+class CaptureProcessWorker(threading.Thread):
+    """并行拍照处理线程。
+
+    在机器人松手后移到拍照点、再移到抓取起点的同时，异步完成：拍照 → YOLO检测 →
+    SAM分割 → 点云补全 → ICP匹配 → 抓取规划。结果（ctx, planning_dict）存入 self.result。
+
+    使用 fixed_start_conf_deg 模式（跳过机器人 RTDE 连接）：
+      - fixed_start_conf_deg = 抓取起点（计划的 RTDE 执行起点）
+      - robot_state_override = 拍照点机器人状态（拍照时机器人位于拍照点）
+    因此本线程不创建任何 RTDE 连接，与主线程的回移不会产生寄存器冲突。
+    """
+
+    def __init__(self, args: SimpleNamespace, camera_instance: object, capture_conf_rad: Any, grasp_start_conf_rad: Any):
+        super().__init__(name="CaptureProcessWorker", daemon=True)
+        self.args = args
+        self.camera_instance = camera_instance
+        self.capture_conf_rad = None if capture_conf_rad is None else np.asarray(capture_conf_rad, dtype=float).reshape(-1)
+        self.grasp_start_conf_rad = None if grasp_start_conf_rad is None else np.asarray(grasp_start_conf_rad, dtype=float).reshape(-1)
+        self.result = None  # (ctx, planning_dict) | None
+        self.error = None
+        self.started_at = None
+        self.capture_elapsed_s = None
+        self.plan_elapsed_s = None
+        self.total_elapsed_s = None
+
+    def run(self) -> None:
+        self.started_at = perf_counter()
+        try:
+            if self.grasp_start_conf_rad is None:
+                # 未配置抓取起点：走普通模式（连接 RTDE 读取状态）
+                fixed_conf_deg = None
+                override = None
+            else:
+                # 计划的 RTDE 执行起点 = 抓取起点（内部按角度处理）
+                fixed_conf_deg = np.degrees(self.grasp_start_conf_rad).tolist()
+                # 拍照时机器人位于拍照点：用拍照点状态写 summary，避免临时 RTDE 连接冲突
+                if self.capture_conf_rad is not None:
+                    override = (self.capture_conf_rad.copy(), None, 0.0)
+                else:
+                    override = (self.grasp_start_conf_rad.copy(), None, 0.0)
+            capture_start = perf_counter()
+            ctx, _metadata = capture_synced_context(
+                self.args,
+                fixed_start_conf_deg=fixed_conf_deg,
+                camera_instance=self.camera_instance,
+                robot_state_override=override,
+            )
+            self.capture_elapsed_s = perf_counter() - capture_start
+            self.ctx = ctx  # 始终暴露 ctx（即使后续规划抛错），供主线程推开阶段复用已拍帧
+
+            plan_start = perf_counter()
+            result = box_object_icp.run_seg_icp_grasp(ctx, pipeline_module=dual_pipeline)
+            self.plan_elapsed_s = perf_counter() - plan_start
+            # result 可能为 None（未检测到物体）
+            self.result = (ctx, result)
+        except Exception as e:
+            print(f"[CaptureProcessWorker] ❌ 拍照处理失败: {e}")
+            self.error = e
+            traceback.print_exc()
+        finally:
+            self.total_elapsed_s = perf_counter() - self.started_at
+            print(
+                "[cycle_timing] "
+                f"capture_s={self.capture_elapsed_s if self.capture_elapsed_s is not None else -1:.3f} "
+                f"perception_plan_s={self.plan_elapsed_s if self.plan_elapsed_s is not None else -1:.3f} "
+                f"worker_total_s={self.total_elapsed_s:.3f}"
+            )
 
 class DualThreadPipeline:
     """双线程流水线：相机线程负责拍照+检测+规划，机器人线程负责运动+执行。
@@ -2031,58 +1833,6 @@ class DualThreadPipeline:
         print(f"[real_pipeline] 双线程流水线结束，共抓取 {self._pick_count} 个物体。")
 
 
-class CaptureProcessWorker(threading.Thread):
-    """并行拍照处理线程。
-
-    在机器人松手后移到拍照点、再移到抓取起点的同时，异步完成：拍照 → YOLO检测 →
-    SAM分割 → 点云补全 → ICP匹配 → 抓取规划。结果（ctx, planning_dict）存入 self.result。
-
-    使用 fixed_start_conf_deg 模式（跳过机器人 RTDE 连接）：
-      - fixed_start_conf_deg = 抓取起点（计划的 RTDE 执行起点）
-      - robot_state_override = 拍照点机器人状态（拍照时机器人位于拍照点）
-    因此本线程不创建任何 RTDE 连接，与主线程的回移不会产生寄存器冲突。
-    """
-
-    def __init__(self, args: SimpleNamespace, camera_instance: object, capture_conf_rad: Any, grasp_start_conf_rad: Any):
-        super().__init__(name="CaptureProcessWorker", daemon=True)
-        self.args = args
-        self.camera_instance = camera_instance
-        self.capture_conf_rad = None if capture_conf_rad is None else np.asarray(capture_conf_rad, dtype=float).reshape(-1)
-        self.grasp_start_conf_rad = None if grasp_start_conf_rad is None else np.asarray(grasp_start_conf_rad, dtype=float).reshape(-1)
-        self.result = None  # (ctx, planning_dict) | None
-        self.error = None
-
-    def run(self) -> None:
-        try:
-            if self.grasp_start_conf_rad is None:
-                # 未配置抓取起点：走普通模式（连接 RTDE 读取状态）
-                fixed_conf_deg = None
-                override = None
-            else:
-                # 计划的 RTDE 执行起点 = 抓取起点（内部按角度处理）
-                fixed_conf_deg = np.degrees(self.grasp_start_conf_rad).tolist()
-                # 拍照时机器人位于拍照点：用拍照点状态写 summary，避免临时 RTDE 连接冲突
-                if self.capture_conf_rad is not None:
-                    override = (self.capture_conf_rad.copy(), None, 0.0)
-                else:
-                    override = (self.grasp_start_conf_rad.copy(), None, 0.0)
-            ctx, _metadata = capture_synced_context(
-                self.args,
-                fixed_start_conf_deg=fixed_conf_deg,
-                camera_instance=self.camera_instance,
-                robot_state_override=override,
-            )
-            self.ctx = ctx  # 始终暴露 ctx（即使后续规划抛错），供主线程推开阶段复用已拍帧
-
-            result = box_object_icp.run_seg_icp_grasp(ctx, pipeline_module=dual_pipeline)
-            # result 可能为 None（未检测到物体）
-            self.result = (ctx, result)
-        except Exception as e:
-            print(f"[CaptureProcessWorker] ❌ 拍照处理失败: {e}")
-            self.error = e
-            traceback.print_exc()
-
-
 def main() -> None:
     args = make_runtime_config()
     utils.normalize_paths(args)
@@ -2096,6 +1846,8 @@ def main() -> None:
     args.object_output_dir = None
     preload_point_hint_model(args)
     preload_yolo_model(args)
+    preload_priority_model(args)
+    preload_adapointr_model(args)
 
     if getattr(args, "run_grasp", True):
         # ===== 预热相机并保持长连接 =====
@@ -2103,7 +1855,7 @@ def main() -> None:
         camera_instance = CaptureImage(save_directory=str(BOX_CAPTURE_ROOT))
         if not camera_instance.is_connected():
             raise ConnectionError("相机连接失败！请检查以太网连接。")
-        print("[real_pipeline] ✅ 相机已连接，将复用此实例避免重复连接")
+        print("[real_pipeline] ✅ 相机已连接")
         # ============================================================
         # 抓取流水线（多物体模式）：
         #   首轮：到拍照点 → 拍照+处理（与移到抓取起点并行）→ RTDE执行(pick+place+松手)
@@ -2111,7 +1863,7 @@ def main() -> None:
         #           拍照+处理；机器人完成松手/离开后，在等待拍照处理线程期间并行回拍照点（不遮挡视野）
         #           再到抓取起点，使回移与处理重叠，处理一完成即可执行下一轮
         # ============================================================
-        print("[real_pipeline] === 抓取流水线启动（多物体模式：下放时并行拍照处理）===")
+        print("[real_pipeline] === 抓取流水线启动 ===")
 
         pick_count = 0
         capture_rad = getattr(args, "capture_conf_rad", None)
@@ -2119,10 +1871,21 @@ def main() -> None:
 
         # 并行拍照处理线程（在机器人下放期间运行，提前重叠下一轮拍照+处理）
         worker = None
+        capture_trigger_count = 0
+        previous_capture_trigger_at = None
 
         def _spawn_worker() -> None:
             """启动下一轮拍照+处理线程（不建 RTDE 连接，与主线程 RTDE 执行并行）。"""
-            nonlocal worker
+            nonlocal worker, capture_trigger_count, previous_capture_trigger_at
+            trigger_at = perf_counter()
+            capture_trigger_count += 1
+            if previous_capture_trigger_at is not None:
+                print(
+                    "[cycle_timing] "
+                    f"cycle={capture_trigger_count - 1} "
+                    f"trigger_to_trigger_s={trigger_at - previous_capture_trigger_at:.3f}"
+                )
+            previous_capture_trigger_at = trigger_at
             worker = CaptureProcessWorker(args, camera_instance, capture_rad, grasp_start_rad)
             worker.start()
 
@@ -2142,11 +1905,10 @@ def main() -> None:
             # 每轮都重新拍照检测；若可抓取则进入抓取循环，否则进入推开阶段；
             # 抓取或推开完成后回到本循环重新检测，直到“本轮既无可抓取也无可推开”为止。
             push_count = 0
-            max_outer_cycles = int(REAL_PIPELINE_CONFIG.get("max_outer_cycles", 40))    # 最大外层循环次数
-            outer_cycle = 0
+            outer_cycle = 0               # 仅计数（用于“首轮不重拍”判断与结束日志），不设上限
             redetect_pending = False  # 仅在“推开改动了场景”后才需重新拍照检测
 
-            while outer_cycle < max_outer_cycles:
+            while True:
                 outer_cycle += 1
 
                 # ---- 检测阶段：仅在“上一轮推开改动了场景”后重新拍照+处理 ----
@@ -2250,19 +2012,13 @@ def main() -> None:
             print("[real_pipeline] 关闭相机连接...")
             conn_status.close_camera_quietly(camera_instance)
 
+            # 关闭 RTDE 共享会话（全程只建连一次，此处统一断开）
+            disconnect_rtde_robot()
+
             print("[real_pipeline] 🛑 流水线已停止")
 
     else:
-        # ============================================================
-        # 交互模式（C/D/P/O 键盘交互）：
-        #   C: 同步机器人状态 + 拍照 + 检测箱子
-        #   D: 分割 + 点云补全 + ICP 位姿估计
-        #   P: 规划抓取路径（带可视化动画）
-        #   O: 执行 RTDE 抓取放置
-        # 创建 Panda3D 世界用于可视化与碰撞检测；相机在按下 C 时按需连接，
-        # 不在此预建长连接（避免与交互内按需连接冲突）。
-        # 进入方式：constants.py 的 REAL_PIPELINE_CONFIG 中将 run_grasp 设为 False。
-        # ============================================================
+        # 交互模式（C/D/P/O 键盘交互）
         print("[real_pipeline] === 交互模式启动（C/D/P/O）===")
         app = InteractiveBottlePickPlaceApp(args, ctx=None, initial_icp=None)
         app.run()
@@ -2276,7 +2032,6 @@ from real_pipeline_planning import (
     build_obstacle_lists,                      # 原模块内部裸用 + box_object(pipeline_module) 调用
     grasp_jaw_width,
     bottle_homomat_for_icp,
-    resolve_place_pose,
 )
 if __name__ == "__main__":
     main()

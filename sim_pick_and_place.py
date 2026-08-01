@@ -22,7 +22,7 @@ import wrs.basis.robot_math as rm  # noqa: E402
 
 from yanjiuyuan.constants import MODEL_DIR, PICK_APPROACH_DEPART_DISTANCE  # noqa: E402
 from yanjiuyuan.sync_real_ur7e_to_wrs import DEFAULT_HOME_CONF  # noqa: E402
-
+from constants import REAL_PIPELINE_CONFIG
 
 CUSTOM_BOTTLE_MODEL_PATH = Path(__file__).resolve().parent / "meshes" / "bottle.STL"
 OBJECT_MODEL_PATH = CUSTOM_BOTTLE_MODEL_PATH if CUSTOM_BOTTLE_MODEL_PATH.exists() else MODEL_DIR / "bottle.stl"
@@ -34,9 +34,8 @@ PLACE_POS = np.array([0.6, -0.12, 0.08], dtype=float)
 PLACE_RPY_DEG = np.array([0.0, 90, 0], dtype=float)
 
 IK_SOLVER = 'ikfast'
-OPEN_JAW_WIDTH = 0.118
-APPROACH_DISTANCE = 0.1    # 抓取路径距离0.1
-# PICK_APPROACH_DISTANCE = 0.13
+OPEN_JAW_WIDTH = REAL_PIPELINE_CONFIG["open_jaw_width"] # 打开宽度0.118m
+APPROACH_DISTANCE = REAL_PIPELINE_CONFIG["grasp_distance"]    # 抓取路径距离0.08m
 
 
 LINEAR_GRANULARITY = 0.015

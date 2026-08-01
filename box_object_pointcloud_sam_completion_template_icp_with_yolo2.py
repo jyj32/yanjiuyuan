@@ -293,6 +293,7 @@ def completion_matching_config_from_runtime_options(source: object, output_dir: 
         selected_outlier_nb_neighbors=int(source.completion_selected_outlier_nb_neighbors),
         selected_outlier_std_ratio=float(source.completion_selected_outlier_std_ratio),
         selected_outlier_min_keep_ratio=float(source.completion_selected_outlier_min_keep_ratio),
+        save_debug_outputs=bool(getattr(source, "save_perception_debug_outputs", False)),
     )
 
 def completion_bottle_icp_config_from_runtime_options(source: object) -> bottle_pose.BottleIcpPoseConfig:
@@ -975,6 +976,7 @@ def run_completion_bottle_icp_on_selected_and_completed(
     output_dir: Path,
     config: bottle_pose.BottleIcpPoseConfig,
     target_voxel_size: Optional[float],
+    save_debug_outputs: bool = False,
 ) -> dict:
     # 把瓶子模板点云对齐到实际拍摄+补全的点云上，求出瓶子在世界坐标系下的位姿。RANSAC粗配准+icp精匹配(第二阶段icp)
     # 1.准备目标点云
@@ -1010,9 +1012,10 @@ def run_completion_bottle_icp_on_selected_and_completed(
     selected_target_path = output_dir / "completion_bottle_selected_target_downsampled_world.ply"
     completed_target_path = output_dir / "completion_bottle_completed_target_downsampled_world.ply"
     combined_target_path = output_dir / "completion_bottle_global_selected_plus_completed_target_world.ply"
-    completion_matching.write_pointcloud(selected_downsampled, selected_target_path)
-    completion_matching.write_pointcloud(completed_downsampled, completed_target_path)
-    completion_matching.write_pointcloud(combined_points, combined_target_path)
+    if save_debug_outputs:
+        completion_matching.write_pointcloud(selected_downsampled, selected_target_path)
+        completion_matching.write_pointcloud(completed_downsampled, completed_target_path)
+        completion_matching.write_pointcloud(combined_points, combined_target_path)
 
     log(
         "[box_object] completion bottle registration targets: "
@@ -1066,8 +1069,9 @@ def run_completion_bottle_icp_on_selected_and_completed(
     global_transform_path = bottle_output_dir / "completion_bottle_global_transform.txt"
     icp_transform_path = bottle_output_dir / "completion_bottle_icp_transform.txt"
     summary_path = bottle_output_dir / "completion_bottle_icp_summary.json"
-    np.savetxt(global_transform_path, global_result.transformation, fmt="%.9f")
-    np.savetxt(icp_transform_path, icp_result.transformation, fmt="%.9f")
+    if save_debug_outputs:
+        np.savetxt(global_transform_path, global_result.transformation, fmt="%.9f")
+        np.savetxt(icp_transform_path, icp_result.transformation, fmt="%.9f")
 
     bottle_summary = {
         "bottle_stl": str(bottle_stl),
@@ -1091,8 +1095,8 @@ def run_completion_bottle_icp_on_selected_and_completed(
         "source_path": None,
         "registered_model_path": None,
         "pointcloud_outputs_saved": False,
-        "global_transform_path": str(global_transform_path),
-        "icp_transform_path": str(icp_transform_path),
+        "global_transform_path": str(global_transform_path) if save_debug_outputs else None,
+        "icp_transform_path": str(icp_transform_path) if save_debug_outputs else None,
         "global_transform": np.asarray(global_result.transformation, dtype=np.float64).tolist(),
         "icp_transform": np.asarray(icp_result.transformation, dtype=np.float64).tolist(),
         "summary_path": str(summary_path),
@@ -1107,14 +1111,23 @@ def run_completion_bottle_icp_on_selected_and_completed(
         "global_target_point_count": int(len(combined_points)),
         "icp_target_point_count": int(len(selected_downsampled)),
         "target_voxel_size": None if target_voxel_size is None or target_voxel_size <= 0 else float(target_voxel_size),
-        "target_selected_downsampled_path": str(selected_target_path),
-        "target_completed_downsampled_path": str(completed_target_path),
-        "target_path": str(combined_target_path),
-        "global_target_path": str(combined_target_path),
-        "icp_target_path": str(selected_target_path),
+        "target_selected_downsampled_path": str(selected_target_path) if save_debug_outputs else None,
+        "target_completed_downsampled_path": str(completed_target_path) if save_debug_outputs else None,
+        "target_path": str(combined_target_path) if save_debug_outputs else None,
+        "global_target_path": str(combined_target_path) if save_debug_outputs else None,
+        "icp_target_path": str(selected_target_path) if save_debug_outputs else None,
         "output_dir": str(output_dir),
     }
-    bottle_summary.update(save_registered_bottle_template_pointclouds(bottle_summary, config, output_dir))
+    if save_debug_outputs:
+        bottle_summary.update(save_registered_bottle_template_pointclouds(bottle_summary, config, output_dir))
+    else:
+        bottle_summary.update(
+            {
+                "global_registered_path": None,
+                "icp_registered_path": None,
+                "registered_template_point_count": int(len(source_pcd.points)),
+            }
+        )
     summary_path.write_text(json.dumps(bottle_summary, indent=2), encoding="utf-8")
     log(
         "[box_object] completion bottle registration result: "
@@ -1666,7 +1679,7 @@ def run_segmentation_and_bottle_icp_attempt(
     ctx: PipelineContext,
     *,
     obj_idx: Optional[int] = None,
-) -> tuple[dict, ExtractionMasks, np.ndarray]:
+) -> tuple[Optional[dict], Optional[ExtractionMasks], Optional[np.ndarray]]:
     # (单个物体)分割→点云补全→ICP匹配
     attempt_args = copy.copy(ctx.args)
     attempt_args._priority_depth = getattr(ctx.capture, "depth", None)
@@ -1688,7 +1701,12 @@ def run_segmentation_and_bottle_icp_attempt(
         # 2D mask 投影到 3D，选出瓶子点云
         selected_mask, mask_projected = apply_2d_mask_to_points(mask_image, ctx.pixel_indices, ctx.candidate_mask)
         if not np.any(selected_mask):
-            raise RuntimeError("No selected object points after applying the 2D mask and box candidate constraints.")
+            # 盒外误检 / 盒子已空：投影到 3D 后无盒内点，不抛异常、干净跳过（视为盒外瓶子，不抓）
+            log(
+                f"[box_object] 无盒内有效物体（投影点 {int(mask_projected.sum())} 个全部在箱子候选区外），"
+                f"视为盒外误检，跳过"
+            )
+            return None, None, None
         masks = ExtractionMasks(
             box_region=ctx.box_region_mask, # 箱子区域 mask
             candidate=ctx.candidate_mask,   # 候选 mask（箱子内的点）
@@ -1719,7 +1737,7 @@ def run_segmentation_and_bottle_icp_attempt(
             selected_mask=selected_mask,
             ctx=ctx,
             summary=summary,
-            save_ply=True,  # 是否保存点云
+            save_ply=bool(getattr(attempt_args, "save_perception_debug_outputs", False)),
         )
         # 把内存点云按物体序号挂到 ctx，供后续（如推开阶段）直接取用，避免重新读盘。
         if obj_idx is not None:
@@ -1751,10 +1769,10 @@ def run_segmentation_and_bottle_icp_attempt(
                     selected_points_world,
                     completion_config,
                     output_prefix=attempt_args.completion_output_prefix,
-                    run_matching=True,
+                    run_matching=False,
                 )
                 completion_summary = completion_result.summary  # 耗时极短
-                completion_summary["surface_template_icp"] = "enabled" # 耗时极短
+                completion_summary["surface_template_icp"] = "skipped_redundant_final_pose_uses_completion_bottle_icp"
             # 第二阶段 ICP（RANSAC 粗配准 + ICP 精配准）
             with timed_step("completion_bottle_icp"):   # 1.25s左右
                 if getattr(attempt_args, "completion_bottle_icp", False):   # 如果有完整物体点云
@@ -1766,6 +1784,9 @@ def run_segmentation_and_bottle_icp_attempt(
                         ctx.output_dir / "completion_bottle_icp",
                         completion_bottle_config,
                         getattr(attempt_args, "completion_bottle_target_voxel_size", None),
+                        save_debug_outputs=bool(
+                            getattr(attempt_args, "save_perception_debug_outputs", False)
+                        ),
                     )
                     completion_summary["completion_bottle_icp"] = completion_bottle_summary
                 else:
@@ -2304,7 +2325,11 @@ def run_seg_icp_grasp(ctx: PipelineContext, pipeline_module):
                     summary, _masks, selected_mask = run_segmentation_and_bottle_icp_attempt(
                         ctx, obj_idx=obj_idx)
                     if summary is None:
-                        raise RuntimeError(f"{obj_label} 分割/补全/ICP 返回空 summary")
+                        # 盒外误检 / 盒子已空：不视为错误，仅 info 日志并跳到下一个物体
+                        log(
+                            f"[run_seg_icp_grasp] {obj_label} 无盒内有效物体（盒外误检或盒子已空），跳过"
+                        )
+                        continue
                     log(f"[run_seg_icp_grasp] {obj_label} ICP 完成")
 
                 # ---- 2d. 提取 ObjectIcpResult ----

@@ -132,10 +132,10 @@ def resolve_ply_frame(ply_path: Path, requested_frame: str) -> str:
     return "camera"
 
 
-def make_robot_provider(args: argparse.Namespace):
+def make_robot_provider(args: argparse.Namespace, robot_x=None):
     if args.mock:
         return MockUR7EState(DEFAULT_HOME_CONF)
-    return RealUR7ERTDEState(robot_ip=args.robot_ip, gp_port=args.gp_port)
+    return RealUR7ERTDEState(robot_ip=args.robot_ip, gp_port=args.gp_port, robot_x=robot_x)
 
 
 def read_robot_snapshot(provider, label: str) -> tuple[np.ndarray, Optional[np.ndarray], Optional[float]]:

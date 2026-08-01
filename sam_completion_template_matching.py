@@ -58,6 +58,7 @@ class CompletionMatchingConfig:
     selected_outlier_nb_neighbors: int = 24
     selected_outlier_std_ratio: float = 1.8
     selected_outlier_min_keep_ratio: float = 0.65
+    save_debug_outputs: bool = False
 
 
 @dataclass
@@ -316,10 +317,17 @@ def prepare_selected_network_input(camera_points: np.ndarray, config: Completion
         "summary": outlier_summary,
     }
 
+_ADAPOINTR_MODULE_CACHE: dict[str, object] = {}
+
+
 def _load_adapointr_module(script_path: Path):
     script_path = resolve_path(script_path)
     if not script_path.exists():
         raise FileNotFoundError(f"AdaPoinTr inference script does not exist: {script_path}")
+    cache_key = str(script_path)
+    cached = _ADAPOINTR_MODULE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     old_path = list(sys.path)
     old_dont_write_bytecode = sys.dont_write_bytecode
@@ -333,6 +341,7 @@ def _load_adapointr_module(script_path: Path):
         spec.loader.exec_module(module)
         if not hasattr(module, "infer"):
             raise RuntimeError(f"AdaPoinTr script has no infer(params) function: {script_path}")
+        _ADAPOINTR_MODULE_CACHE[cache_key] = module
         return module
     finally:
         sys.path[:] = old_path
@@ -348,6 +357,7 @@ def run_adapointr_completion(
 
     output_dir = resolve_path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    save_debug = bool(config.save_debug_outputs)
 
     partial_camera_path = output_dir / f"{output_prefix}_partial_camera.ply"
     selected_downsampled_camera_path = output_dir / f"{output_prefix}_selected_downsampled_camera_2048.ply"
@@ -359,58 +369,64 @@ def run_adapointr_completion(
     completed_camera_path = output_dir / f"{output_prefix}_completed_camera.ply"
     completed_camera_npy_path = output_dir / f"{output_prefix}_completed_camera.npy"
     camera_points = np.asarray(camera_points, dtype=np.float64).reshape(-1, 3)  # 0.0s把输入点云转成 (N, 3) 的 float64 数组
-    write_pointcloud(camera_points, partial_camera_path)    # 0.0628s，把完整点云写成 .ply 文件
+    if save_debug:
+        write_pointcloud(camera_points, partial_camera_path)
     # FPS下采样 → 统计离群点滤波 → 强制点数对齐
     selected_input = prepare_selected_network_input(camera_points, config)  # 10s➡0.26s
-    write_pointcloud(selected_input["downsampled_points"], selected_downsampled_camera_path)
-    write_pointcloud(selected_input["filtered_points"], selected_filtered_camera_path)
-    write_pointcloud(selected_input["network_points"], adapointr_input_camera_path)
+    if save_debug:
+        write_pointcloud(selected_input["downsampled_points"], selected_downsampled_camera_path)
+        write_pointcloud(selected_input["filtered_points"], selected_filtered_camera_path)
+        write_pointcloud(selected_input["network_points"], adapointr_input_camera_path)
 
     module = _load_adapointr_module(config.adapointr_script)    # 动态加载推理脚本,0.022s
     params = SimpleNamespace(
         input=str(adapointr_input_camera_path),
+        input_points=np.asarray(selected_input["network_points"], dtype=np.float32),
+        input_point_count=int(config.network_input_points),
         input_type=2,
         checkpoint=str(resolve_path(config.adapointr_checkpoint)),
-        save_path=str(completed_camera_path),
+        save_path=str(completed_camera_path) if save_debug else None,
+        save_output=save_debug,
         global_scale=float(config.global_scale),
         num_points=int(config.num_points),
         num_query=int(config.num_query),
         device=str(config.device),
         visualize=False,
-        save_network_input_path=str(network_input_camera_path),
-        save_normalized_input_path=str(normalized_input_camera_path),
-        save_preprocess_meta_path=str(preprocess_meta_path),
+        save_network_input_path=str(network_input_camera_path) if save_debug else None,
+        save_normalized_input_path=str(normalized_input_camera_path) if save_debug else None,
+        save_preprocess_meta_path=str(preprocess_meta_path) if save_debug else None,
     )
     time2 = time.time()
-    module.infer(params)    # 执行推理1.1s
+    completed_in_memory = module.infer(params)    # 执行推理1.1s
     time3 = time.time()
     print(f"infer module time: {time3 - time2}")
     time4 = time.time()
-    if not completed_camera_path.exists():
-        raise RuntimeError(
-            "AdaPoinTr inference finished without writing the completed point cloud: "
-            f"{completed_camera_path}"
-        )
-
-    completed_camera_points = read_points(completed_camera_path)
-    np.save(completed_camera_npy_path, completed_camera_points.astype(np.float32))
-    network_input_camera_points = read_points(network_input_camera_path) if network_input_camera_path.exists() else selected_input["network_points"]
+    if completed_in_memory is not None:
+        completed_camera_points = np.asarray(completed_in_memory, dtype=np.float64).reshape(-1, 3)
+    elif completed_camera_path.exists():
+        # Compatibility fallback for an older external AdaPoinTr script.
+        completed_camera_points = read_points(completed_camera_path)
+    else:
+        raise RuntimeError("AdaPoinTr inference returned no completed point cloud.")
+    if save_debug:
+        np.save(completed_camera_npy_path, completed_camera_points.astype(np.float32))
+    network_input_camera_points = np.asarray(selected_input["network_points"], dtype=np.float64)
     time5 = time.time()
     print(f"input time: {time5 - time4}")   # 0.01
     return {
-        "partial_camera_path": partial_camera_path,
-        "selected_downsampled_camera_path": selected_downsampled_camera_path,
+        "partial_camera_path": partial_camera_path if save_debug else None,
+        "selected_downsampled_camera_path": selected_downsampled_camera_path if save_debug else None,
         "selected_downsampled_camera_points": selected_input["downsampled_points"],
-        "selected_filtered_camera_path": selected_filtered_camera_path,
+        "selected_filtered_camera_path": selected_filtered_camera_path if save_debug else None,
         "selected_filtered_camera_points": selected_input["filtered_points"],
         "selected_outlier_filter": selected_input["summary"],
-        "adapointr_input_camera_path": adapointr_input_camera_path,
-        "network_input_camera_path": network_input_camera_path,
+        "adapointr_input_camera_path": adapointr_input_camera_path if save_debug else None,
+        "network_input_camera_path": network_input_camera_path if save_debug else None,
         "network_input_camera_points": network_input_camera_points,
-        "normalized_input_camera_path": normalized_input_camera_path,
-        "preprocess_meta_path": preprocess_meta_path,
-        "completed_camera_path": completed_camera_path,
-        "completed_camera_npy_path": completed_camera_npy_path,
+        "normalized_input_camera_path": normalized_input_camera_path if save_debug else None,
+        "preprocess_meta_path": preprocess_meta_path if save_debug else None,
+        "completed_camera_path": completed_camera_path if save_debug else None,
+        "completed_camera_npy_path": completed_camera_npy_path if save_debug else None,
         "completed_camera_points": completed_camera_points,
     }
 
@@ -702,6 +718,7 @@ def run_completion_matching_on_sam_world_points(
     output_dir = resolve_path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     world_to_cam = np.linalg.inv(np.asarray(config.cam_to_world, dtype=np.float64))
+    save_debug = bool(config.save_debug_outputs)
 
     partial_world_path = output_dir / f"{output_prefix}_partial_world.ply"
     partial_camera_original_path = output_dir / f"{output_prefix}_partial_camera_original.ply"
@@ -714,13 +731,16 @@ def run_completion_matching_on_sam_world_points(
     matching_target_world_path = output_dir / f"{output_prefix}_matching_target_selected_filtered_plus_completed_world.ply"
     summary_path = output_dir / f"{output_prefix}_completion_matching_summary.json"
 
-    write_pointcloud(selected_points_world, partial_world_path)
+    if save_debug:
+        write_pointcloud(selected_points_world, partial_world_path)
     selected_points_camera = transform_points(selected_points_world, world_to_cam)
-    write_pointcloud(selected_points_camera, partial_camera_original_path)
+    if save_debug:
+        write_pointcloud(selected_points_camera, partial_camera_original_path)
 
     selected_center_camera = selected_points_camera.mean(axis=0)
     selected_points_camera_centered = selected_points_camera - selected_center_camera
-    write_pointcloud(selected_points_camera_centered, partial_camera_centered_unflipped_path)
+    if save_debug:
+        write_pointcloud(selected_points_camera_centered, partial_camera_centered_unflipped_path)
     selected_points_camera_origin = reflect_points_across_xy_plane(selected_points_camera_centered)
     network_to_camera_original = translation_homomat(selected_center_camera) @ XY_PLANE_REFLECTION
     network_to_world = np.asarray(config.cam_to_world, dtype=np.float64) @ network_to_camera_original
@@ -735,24 +755,30 @@ def run_completion_matching_on_sam_world_points(
     network_input_camera_origin_points = np.asarray(completion["network_input_camera_points"], dtype=np.float64).reshape(-1, 3)
     network_input_camera_centered_points = reflect_points_across_xy_plane(network_input_camera_origin_points)
     network_input_camera_original_points = network_input_camera_centered_points + selected_center_camera
-    write_pointcloud(network_input_camera_original_points, network_input_camera_original_path)
+    if save_debug:
+        write_pointcloud(network_input_camera_original_points, network_input_camera_original_path)
     network_input_world_points = transform_points(network_input_camera_original_points, config.cam_to_world)
-    write_pointcloud(network_input_world_points, network_input_world_path)
+    if save_debug:
+        write_pointcloud(network_input_world_points, network_input_world_path)
 
     completed_camera_origin_points = np.asarray(completion["completed_camera_points"], dtype=np.float64).reshape(-1, 3)
     completed_camera_centered_points = reflect_points_across_xy_plane(completed_camera_origin_points)
     completed_camera_original_points = completed_camera_centered_points + selected_center_camera
-    write_pointcloud(completed_camera_original_points, completed_camera_original_path)
+    if save_debug:
+        write_pointcloud(completed_camera_original_points, completed_camera_original_path)
     completed_world_points = transform_points(completed_camera_original_points, config.cam_to_world)
-    write_pointcloud(completed_world_points, completed_world_path)
+    if save_debug:
+        write_pointcloud(completed_world_points, completed_world_path)
 
     selected_filtered_camera_origin_points = np.asarray(completion["selected_filtered_camera_points"], dtype=np.float64).reshape(-1, 3)
     matching_target_camera_origin_points = np.vstack((selected_filtered_camera_origin_points, completed_camera_origin_points))
-    write_pointcloud(matching_target_camera_origin_points, matching_target_camera_path)
+    if save_debug:
+        write_pointcloud(matching_target_camera_origin_points, matching_target_camera_path)
     matching_target_camera_centered_points = reflect_points_across_xy_plane(matching_target_camera_origin_points)
     matching_target_camera_original_points = matching_target_camera_centered_points + selected_center_camera
     matching_target_world_points = transform_points(matching_target_camera_original_points, config.cam_to_world)
-    write_pointcloud(matching_target_world_points, matching_target_world_path)
+    if save_debug:
+        write_pointcloud(matching_target_world_points, matching_target_world_path)
 
     matching = None
     if run_matching:
@@ -770,6 +796,11 @@ def run_completion_matching_on_sam_world_points(
                 output_prefix,
             )
         )
+
+    def saved_debug_path(path) -> Optional[str]:
+        if not save_debug or path is None:
+            return None
+        return str(path)
 
     summary = {
         "pipeline": "sam_world_points -> camera_frame_centered_at_selected_mean -> xy_plane_reflection -> adapointr_completion"
@@ -795,35 +826,35 @@ def run_completion_matching_on_sam_world_points(
             "network_to_camera_original_transform": network_to_camera_original.astype(float).tolist(),
             "network_to_world_transform": network_to_world.astype(float).tolist(),
             "network_target_point_count": int(config.network_input_points),
-            "selected_downsampled_camera_path": str(completion["selected_downsampled_camera_path"]),
+            "selected_downsampled_camera_path": saved_debug_path(completion["selected_downsampled_camera_path"]),
             "selected_downsampled_point_count": int(len(completion["selected_downsampled_camera_points"])),
-            "selected_filtered_camera_path": str(completion["selected_filtered_camera_path"]),
+            "selected_filtered_camera_path": saved_debug_path(completion["selected_filtered_camera_path"]),
             "selected_filtered_point_count": int(len(selected_filtered_camera_origin_points)),
             "selected_outlier_filter": completion["selected_outlier_filter"],
-            "adapointr_input_camera_path": str(completion["adapointr_input_camera_path"]),
+            "adapointr_input_camera_path": saved_debug_path(completion["adapointr_input_camera_path"]),
             "centered_partial_camera_mean": selected_points_camera_centered.mean(axis=0).astype(float).tolist(),
             "mirrored_partial_camera_mean": selected_points_camera_origin.mean(axis=0).astype(float).tolist(),
-            "partial_camera_original_path": str(partial_camera_original_path),
-            "partial_camera_centered_unflipped_path": str(partial_camera_centered_unflipped_path),
-            "partial_camera_origin_path": str(completion["partial_camera_path"]),
-            "network_input_camera_path": str(completion["network_input_camera_path"]),
+            "partial_camera_original_path": saved_debug_path(partial_camera_original_path),
+            "partial_camera_centered_unflipped_path": saved_debug_path(partial_camera_centered_unflipped_path),
+            "partial_camera_origin_path": saved_debug_path(completion["partial_camera_path"]),
+            "network_input_camera_path": saved_debug_path(completion["network_input_camera_path"]),
             "network_input_camera_point_count": int(len(network_input_camera_origin_points)),
-            "network_input_camera_original_path": str(network_input_camera_original_path),
-            "network_input_world_path": str(network_input_world_path),
-            "normalized_input_camera_path": str(completion["normalized_input_camera_path"]),
-            "preprocess_meta_path": str(completion["preprocess_meta_path"]),
-            "completed_camera_path": str(completion["completed_camera_path"]),
-            "completed_camera_original_path": str(completed_camera_original_path),
-            "completed_camera_npy_path": str(completion["completed_camera_npy_path"]),
+            "network_input_camera_original_path": saved_debug_path(network_input_camera_original_path),
+            "network_input_world_path": saved_debug_path(network_input_world_path),
+            "normalized_input_camera_path": saved_debug_path(completion["normalized_input_camera_path"]),
+            "preprocess_meta_path": saved_debug_path(completion["preprocess_meta_path"]),
+            "completed_camera_path": saved_debug_path(completion["completed_camera_path"]),
+            "completed_camera_original_path": saved_debug_path(completed_camera_original_path),
+            "completed_camera_npy_path": saved_debug_path(completion["completed_camera_npy_path"]),
         },
         "paths": {
-            "partial_world_path": str(partial_world_path),
-            "partial_camera_centered_unflipped_path": str(partial_camera_centered_unflipped_path),
-            "partial_camera_origin_path": str(completion["partial_camera_path"]),
-            "network_input_world_path": str(network_input_world_path),
-            "completed_world_path": str(completed_world_path),
-            "matching_target_camera_path": str(matching_target_camera_path),
-            "matching_target_world_path": str(matching_target_world_path),
+            "partial_world_path": saved_debug_path(partial_world_path),
+            "partial_camera_centered_unflipped_path": saved_debug_path(partial_camera_centered_unflipped_path),
+            "partial_camera_origin_path": saved_debug_path(completion["partial_camera_path"]),
+            "network_input_world_path": saved_debug_path(network_input_world_path),
+            "completed_world_path": saved_debug_path(completed_world_path),
+            "matching_target_camera_path": saved_debug_path(matching_target_camera_path),
+            "matching_target_world_path": saved_debug_path(matching_target_world_path),
             "summary_path": str(summary_path),
         },
     }

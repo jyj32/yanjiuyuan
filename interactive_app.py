@@ -33,7 +33,7 @@ for root in (REPO_ROOT, WRS_ROOT):
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
 
-from yanjiuyuan.constants import BOX_CAPTURE_ROOT, BOTTLE_ROBOT_SIDE_PLACE_POS, CAMERA_TO_WORLD # noqa: E402
+from yanjiuyuan.constants import BOX_CAPTURE_ROOT, CAMERA_TO_WORLD # noqa: E402
 from yanjiuyuan import box_object_pointcloud_sam_completion_template_icp_with_yolo2 as box_object_icp  # noqa: E402
 from yanjiuyuan import connection_status as conn_status  # noqa: E402
 from yanjiuyuan import pick_place_rtde_utils as rtde_utils  # noqa: E402
@@ -53,6 +53,7 @@ from real_bottle_pick_place_interactive3_point_completion_with_yolo2_dual import
     apply_sam_task_settings,
     bottle_pose_summary_from_summary,
     capture_synced_context,
+    get_rtde_robot,
     move_to_capture_point,
     object_icp_result_from_summary,
     refresh_sam_task_settings,
@@ -496,7 +497,9 @@ class InteractiveBottlePickPlaceApp:    # 交互式瓶子抓取CDPO
         rtde_robot = object()
         try:
             if not dry_run:
-                rtde_robot = UR7EDH76_RTDE(robot_ip=self.args.robot_ip, gp_port=self.args.gp_port)
+                # 复用进程级单例 RTDE 会话（get_rtde_robot），避免与 startup / C
+                # 同步的会话重复 new 而报 "RTDE input registers are already in use"。
+                rtde_robot = get_rtde_robot(self.args)
                 print("[real_pipeline] Opening gripper before RTDE execution...")
                 rtde_robot.open_gripper()
             else:
@@ -525,12 +528,8 @@ class InteractiveBottlePickPlaceApp:    # 交互式瓶子抓取CDPO
             print(f"[real_pipeline] O execution failed: {exc}")
             traceback.print_exc()
         finally:
-            disconnect = getattr(rtde_robot, "disconnect", None)
-            if disconnect is not None:
-                try:
-                    disconnect()
-                except Exception as exc:
-                    print(f"[real_pipeline] Warning: RTDE disconnect failed: {exc}")
+            # rtde_robot 为进程级共享单例（get_rtde_robot），此处不主动断开，
+            # 否则会切断 startup / C 同步仍在用的会话；统一由 disconnect_rtde_robot() 回收。
             self.environment_stale = True
             self.running = False
 

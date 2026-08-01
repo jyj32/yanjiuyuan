@@ -171,7 +171,7 @@ if __name__ == '__main__':
     viewer = ViewerControl(
         root=root,
         base=base,
-        pickle_path="./result/bottle_dh76_push.pickle",   # 修改为您的 pickle 路径
+        pickle_path="./result/bottle_dh76_front_back.pickle",   # 修改为您的 pickle 路径
         obj_path="../models/bottle.stl",    # 物体模型路径（可选）
         obj_rgba=[1, 1, 0, 0.6]             # 黄色半透明
     )

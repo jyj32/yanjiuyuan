@@ -287,7 +287,7 @@ if __name__ == "__main__":
         model_path=PACKAGE_ROOT / "models" / "bottle_detect2.pt",
         save_dir=PACKAGE_ROOT / "images" / "Mech",
     )
-    image_path = r"E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\captures\20260729-134721\rgb.png"
+    image_path = r"E:\py_project\wrsrobot\wrs_v2\yanjiuyuan\images\Mech\color_image_20260623-173827.jpg"
     img = cv2.imread(image_path)
 
     detections = detector.detect(
